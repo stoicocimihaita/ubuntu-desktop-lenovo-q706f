@@ -5,6 +5,8 @@ Wayland) to the **Lenovo Tab P12 Pro / Xiaoxin Pad Pro 12.6** (`TB-Q706F`, coden
 Snapdragon 870 / SM8250, Adreno 650, 12.6" 2560×1600 AMOLED), running a **mainline Linux
 kernel** instead of Android.
 
+Discussion, questions and test reports: [XDA thread](https://xdaforums.com/t/rom-unofficial-wip-ubuntu-26-04-desktop-gnome-mainline-linux-7-3-for-lenovo-tab-p12-pro-xiaoxin-pad-pro-12-6-tb-q706f.4808892/).
+
 - **Stage: bring-up.** It runs as the author's daily test system on **one** tablet
   (8 GB / 256 GB, ROW), but it is not a finished product. Treat it as a developer preview.
 - **Kernel:** upstream **Linux 7.3.4** (kernel.org tarball, sha256 pinned) plus the patch
