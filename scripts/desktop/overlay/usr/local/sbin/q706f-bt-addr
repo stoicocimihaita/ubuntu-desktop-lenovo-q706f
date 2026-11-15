@@ -1,0 +1,66 @@
+#!/bin/sh
+# The QCA6390 comes up without a public address on mainline (the real one lives in
+# Android NV storage), so the kernel registers hci0 as "unconfigured" and bluetoothd
+# does not see it until an address is set.
+#
+# Address source: /etc/q706f-bt-addr (one line, XX:XX:XX:XX:XX:XX) if present --
+# put the factory address there so bonds can be shared with the other OS -- else a
+# stable locally-administered address derived from the device serial number.
+#
+# Idempotent: safe to run at boot (before bluetoothd), from udev whenever hci0 is
+# (re)registered, and by hand. The kernel keeps the address across rfkill and
+# power cycles for as long as hci0 stays registered.
+HCI=hci0
+log() { echo "q706f-bt-addr: $*"; }
+
+i=0
+while [ ! -e /sys/class/bluetooth/$HCI ]; do
+  i=$((i + 1))
+  [ $i -gt 15 ] && { log "$HCI did not appear"; exit 0; }
+  sleep 1
+done
+
+A=
+[ -s /etc/q706f-bt-addr ] && A=$(tr -d ' \t\r\n' </etc/q706f-bt-addr | tr a-f A-F)
+if ! echo "$A" | grep -Eq '^([0-9A-F]{2}:){5}[0-9A-F]{2}$'; then
+  [ -n "$A" ] && log "ignoring malformed /etc/q706f-bt-addr"
+  S=$(sed -n 's/.*androidboot\.serialno=\([^ ]*\).*/\1/p' /proc/cmdline)
+  H=$(printf '%s' "${S:-q706f}-bt" | sha256sum | cut -c1-10 | tr a-f A-F)
+  A="02:$(echo "$H" | sed 's/../&:/g; s/:$//')"
+fi
+
+# btmgmt hangs without a terminal, so give it a pseudo-terminal.
+mgmt() { timeout 10 python3 -c 'import pty,sys; pty.spawn(sys.argv[1:])' btmgmt -i $HCI "$@" 2>/dev/null | tr -d '\r'; }
+# Address of the configured controller; empty while it is still unconfigured.
+cur_addr() { mgmt info | sed -n 's/^[[:space:]]*addr \([0-9A-Fa-f:]\{17\}\).*/\1/p' | head -n1 | tr a-f A-F; }
+
+changed=0
+n=0
+while [ $n -lt 20 ]; do
+  n=$((n + 1))
+  C=$(cur_addr)
+  if [ "$C" = "$A" ]; then
+    if [ $changed = 1 ]; then
+      # bluetoothd caches the adapter address (and the bonds stored under it).
+      systemctl --no-block try-restart bluetooth.service 2>/dev/null
+      log "address changed"
+    fi
+    exit 0
+  fi
+  if [ -n "$C" ]; then
+    # Configured with another address: it can only be changed while powered off.
+    # The driver programs the new address on the next power on.
+    mgmt power off >/dev/null
+    mgmt public-addr "$A" >/dev/null
+    mgmt power on >/dev/null
+    changed=1
+  else
+    # Unconfigured: setting the address makes the kernel run the firmware setup
+    # (several seconds) and only then announce the controller to bluetoothd, which
+    # powers it on by itself (AutoEnable).
+    mgmt public-addr "$A" >/dev/null
+  fi
+  sleep 2
+done
+log "could not set the address"
+exit 0

@@ -1,0 +1,32 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] q706f: select the Lenovo Wi-Fi board data with a calibration variant
+
+*** DO NOT APPLY WITHOUT OWNER APPROVAL ***
+
+The QCA6390 reports board_id 0xff, so ath11k loads the generic
+"bus=pci,qmi-chip-id=0,qmi-board-id=255" entry of board-2.bin (QCA reference
+design calibration: TX power tables, antenna gains, regulatory limits).
+With this property the driver first asks for
+"bus=pci,qmi-chip-id=0,qmi-board-id=255,variant=Lenovo_Q706F".
+
+That entry is not in linux-firmware. scripts/desktop/setup-wifi-board.sh
+builds a board-2.bin containing it from the stock bdwlan.elf (modem
+partition, image/qca6390/; proprietary, never in the repo). Install that file
+first: if the variant entry is missing the driver falls back to the generic
+entry, so the patch alone is harmless but useless.
+
+Unverified: nothing was tested with the stock board data yet (range, TX
+power, default country). Keep the previous boot image at hand: a bad board
+file means no Wi-Fi, and Wi-Fi may be the only way into the tablet.
+
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+@@ -1223,6 +1223,8 @@
+ 		vddrfa1p7-supply = <&vreg_pmu_rfa_1p7>;
+ 		vddpcie0p9-supply = <&vreg_pmu_pcie_0p9>;
+ 		vddpcie1p8-supply = <&vreg_pmu_pcie_1p8>;
++
++		qcom,calibration-variant = "Lenovo_Q706F";
+ 	};
+ };
+ 

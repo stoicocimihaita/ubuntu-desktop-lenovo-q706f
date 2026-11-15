@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 18:06:47 +0200
+Subject: [PATCH] arm64: dts: qcom: sm8250-lenovo-q706f: add the Goodix
+ fingerprint sensor
+
+Describe the fingerprint sensor for the goodix-fp-spi driver: interrupt on
+TLMM 23 (rising edge), reset on TLMM 26 (active low), supply switched by
+TLMM 131 modelled as a fixed regulator fed from vreg_l7c_ts_3p0, and the
+trusted application name "goodixfp". Values come from the stock overlay
+(dtbo goodix_fp node) and the stock HAL (ta_name). The SPI bus (QUP SE14,
+TLMM 40-43) stays with TrustZone through gpio-reserved-ranges.
+
+TLMM 26 was claimed by audio4_1p8_supply through the spkr_1_sd_n_active
+pin state, a WSA speaker-enable inherited from the Qualcomm reference
+board. In the stock DT the only consumer of TLMM 26 is the fingerprint
+reset; the cs35l45 amplifiers use TLMM 49 and 127. Drop the GPIO and the
+pin state from audio4_1p8_supply and keep it as a GPIO-less always-on
+regulator so the cs35l45 vdd-batt-supply references still resolve.
+
+THIS CHANGES THE SPEAKER SUPPLY WIRING. It must not be used beyond a RAM
+boot until the owner has confirmed left/right speaker playback with it.
+
+Signed-off-by: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+---
+q706f-notes:
+  Origin: q706f port (new), values from the stock Lenovo overlay (dtbo goodix_fp)
+          and docs/EVALUARE-AMPRENTA-2026-11-13.md sections 1 and 11.4.
+  Licence: GPL-2.0
+  Rebase onto 7.3.4: n/a (written on 7.3.4)
+  WARNING: changes the cs35l45 supply wiring (TLMM 26 leaves audio4_1p8_supply).
+           Needs the owner's left/right speaker test before any use beyond RAM boot.
+
+ .../boot/dts/qcom/sm8250-lenovo-q706f.dts     | 70 +++++++++++++++++--
+ 1 file changed, 63 insertions(+), 7 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+index 0ac5ed69d..ea2ea43b0 100644
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+@@ -242,19 +242,62 @@ audio3_1p8_supply: audio3-1p8-regulator {
+ 		regulator-boot-on;
+ 		regulator-always-on;
+ 	};
++	/*
++	 * Placeholder supply for the cs35l45 vdd-batt inputs. It used to switch
++	 * TLMM 26 ("spkr_1_sd_n", a WSA enable inherited from the Qualcomm
++	 * reference board). On this board TLMM 26 is the fingerprint sensor
++	 * reset (stock overlay: goodix_fp fp-gpio-reset); the amplifiers use
++	 * TLMM 49 and 127. Kept as a GPIO-less always-on regulator so the
++	 * cs35l45 supply references stay resolved.
++	 */
+ 	audio4_1p8_supply: audio4-1p8-regulator {
+ 		compatible = "regulator-fixed";
+ 		regulator-name = "audio4_1p8_supply";
+ 		regulator-min-microvolt = <1800000>;
+ 		regulator-max-microvolt = <1800000>;
+-		pinctrl-names = "default";
+-		pinctrl-0 = <&spkr_1_sd_n_active>;
+-		gpio = <&tlmm 26 GPIO_ACTIVE_HIGH>;
+-		enable-active-high;
+ 		regulator-boot-on;
+ 		regulator-always-on;
+ 	};
+ 
++	/*
++	 * Fingerprint sensor supply: TLMM 131 is "fp-gpio-envdd" in the stock
++	 * overlay; the stock driver drives it high on open and never touches a
++	 * regulator. The rail behind the switch is assumed to be pm8150a l7
++	 * (the stock vdd-supply), shared with the touchscreen.
++	 */
++	fp_vdd: regulator-fp-vdd {
++		compatible = "regulator-fixed";
++		regulator-name = "fp_vdd";
++		regulator-min-microvolt = <3000000>;
++		regulator-max-microvolt = <3000000>;
++		gpio = <&tlmm 131 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		vin-supply = <&vreg_l7c_ts_3p0>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&fp_en_default>;
++	};
++
++	/*
++	 * Goodix fingerprint sensor. Its SPI bus (QUP SE14, TLMM 40-43) belongs
++	 * to TrustZone (see gpio-reserved-ranges); only the trusted application
++	 * "goodixfp" talks to the sensor. "goodix,gf3626" is the only compatible
++	 * the driver matches; the real part number is not known yet.
++	 */
++	fingerprint {
++		compatible = "goodix,gf3626";
++
++		interrupt-parent = <&tlmm>;
++		interrupts = <23 IRQ_TYPE_EDGE_RISING>;
++
++		reset-gpios = <&tlmm 26 GPIO_ACTIVE_LOW>;
++		vdd-supply = <&fp_vdd>;
++
++		firmware-name = "goodixfp";
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&fp_int_default>, <&fp_reset_default>;
++	};
++
+ 	usb_vbus_5p0: usb-vbus-5p0-regulator {
+ 		compatible = "regulator-fixed";
+ 		regulator-name = "usb_vbus_5p0";
+@@ -1912,12 +1955,25 @@ mclk2-pins {
+ 		};
+ 	};
+ 
+-	spkr_1_sd_n_active: spkr-1-sd-n-active {
++	fp_int_default: fp-int-default-state {
++		pins = "gpio23";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-down;
++	};
++
++	fp_reset_default: fp-reset-default-state {
+ 		pins = "gpio26";
+ 		function = "gpio";
+-		drive-strength = <8>;
++		drive-strength = <2>;
++		bias-disable;
++	};
++
++	fp_en_default: fp-en-default-state {
++		pins = "gpio131";
++		function = "gpio";
++		drive-strength = <2>;
+ 		bias-disable;
+-		output-high;
+ 	};
+ 
+ 	cs35l45_1_irq_default: cs35l45-1-irq-default {

@@ -1,0 +1,24 @@
+[Unit]
+Description=Precision Pen 3: re-pair automatically when the pen lost its bond (q706f)
+Documentation=file:/usr/local/libexec/q706f-pen-rebond
+# Enabled through the multi-user.target.wants symlink in the overlay.
+# Disable: systemctl disable --now q706f-pen-rebond.service
+After=bluetooth.service
+
+[Service]
+# Add --dry-run here (drop-in) to only log what would be done.
+ExecStart=/usr/local/libexec/q706f-pen-rebond
+Restart=on-failure
+RestartSec=30
+StateDirectory=q706f
+StateDirectoryMode=0700
+UMask=0077
+ProtectHome=yes
+ProtectSystem=strict
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_BLUETOOTH
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

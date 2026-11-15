@@ -1,0 +1,7 @@
+{
+  "uuid": "osk-button@q706f",
+  "name": "On-screen keyboard button",
+  "description": "Panel button that opens or closes the on-screen keyboard on demand, for apps that do not announce text fields (remote desktop, XWayland) and for pen-only use.",
+  "shell-version": ["49", "50"],
+  "url": ""
+}

@@ -1,0 +1,395 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] ASoC: as33970: never download firmware at probe, fail soft
+
+The AS33970 has no firmware of its own: after power-up or reset its mask ROM
+answers with 'C' at address 0 and waits for a host download (on Android the
+vendor tool "i2c_load -r -s partition_boot2flash.img" runs at every boot and
+then writes 1 to the driver's fw_status attribute).
+
+The driver used to send a version command into the ROM loader and, when that
+timed out, started the download from probe; with an image of another size
+the probe failed and took the whole sound card down with it.
+
+- Detect the ROM loader with a plain read and send no command to it.
+- Register the DAI whether or not firmware runs; opening the capture stream
+  returns -ENODEV without firmware.
+- Download only on an explicit write to the new fw_load attribute, with the
+  image layout taken from the EFLC/EFSC headers (as the vendor tool does)
+  instead of one hard-coded image size.
+- fw_status behaves as in the vendor driver: writing 1 is accepted only if
+  the firmware answers the version command.
+- Send GET commands with the vendor framing (module ID only).
+- The reset GPIO is optional.
+---
+diff --git a/sound/soc/codecs/as33970.c b/sound/soc/codecs/as33970.c
+index bfb340d173..1eee882e37 100644
+--- a/sound/soc/codecs/as33970.c
++++ b/sound/soc/codecs/as33970.c
+@@ -33,12 +33,14 @@
+ #define PAR_INDEX_I2S_TX_WIDTH 19
+ #define PAR_INDEX_I2S_TX_NUM_OF_BITS 23
+ #define AS33970_FIRMWARE "as33970/partition_boot2flash.img"
+-#define AS33970_FW_SIZE 0x6b000
+-#define AS33970_BOOT_OFFSET 0x100
+-#define AS33970_BOOT_SIZE 0x2000
+-#define AS33970_SYSTEM_OFFSET 0x10000
+-#define AS33970_SYSTEM_SIZE 0x5b000
+ #define AS33970_BLOCK_SIZE 0x1000
++/* Image header fields, as parsed by the vendor "i2c_load" tool. */
++#define AS33970_HDR_SIZE 0x100
++#define AS33970_HDR_BOOT_OFFSET 0x08	/* le32, bytes */
++#define AS33970_HDR_BOOT_SIZE 0x0c	/* le32, bytes */
++#define AS33970_HDR_BLOCKS 0x26		/* le16, 4 KiB blocks */
++/* First byte at address 0 while the mask-ROM loader waits for an image. */
++#define AS33970_ROM_PROMPT 0x43
+ #define AS33970_I2C_DATA_MAX 120
+ #define AS33970_LOADER_HEADER_SIZE 8
+ #define AS33970_LOADER_REPLY_MAX 64
+@@ -63,6 +65,13 @@ struct as33970_priv {
+ 	u8 loader_seq;
+ };
+ 
++struct as33970_fw_layout {
++	u32 boot_offset;
++	u32 boot_size;
++	u32 system_offset;
++	u32 system_blocks;
++};
++
+ static u32 as33970_loader_hash(const void *buffer, size_t length)
+ {
+ 	const __le16 *words = buffer;
+@@ -249,19 +258,68 @@ static size_t as33970_effective_block_size(const u8 *data)
+ 	return AS33970_BLOCK_SIZE;
+ }
+ 
++/*
++ * The DSP has no firmware of its own: after power-up or reset its mask ROM
++ * answers on I2C with 'C' at address 0 and waits there until a host sends an
++ * image. Nothing but raw reads is safe in that state.
++ */
++static bool as33970_in_rom_loader(struct as33970_priv *as33970)
++{
++	struct i2c_client *client = to_i2c_client(as33970->dev);
++	u8 status[4];
++
++	if (as33970_raw_read(client, 0, status, sizeof(status)))
++		return false;
++	return status[0] == AS33970_ROM_PROMPT && !status[1] && !status[2] &&
++	       !status[3];
++}
++
++/*
++ * "EFLC" container: second-stage loader at boot_offset, "EFSC" system image
++ * on a 4 KiB block boundary; the system header holds its own block count.
++ * The image sizes differ between ROM releases (0x5b and 0x65 blocks seen).
++ */
++static int as33970_parse_firmware(const struct firmware *firmware,
++				  struct as33970_fw_layout *layout)
++{
++	const u8 *data = firmware->data;
++
++	if (firmware->size < AS33970_HDR_SIZE || memcmp(data, "EFLC", 4))
++		return -EINVAL;
++	layout->boot_offset = get_unaligned_le32(data + AS33970_HDR_BOOT_OFFSET);
++	layout->boot_size = get_unaligned_le32(data + AS33970_HDR_BOOT_SIZE);
++	layout->system_offset = get_unaligned_le16(data + AS33970_HDR_BLOCKS) *
++				AS33970_BLOCK_SIZE;
++	if (!layout->boot_size || layout->boot_size % AS33970_BLOCK_SIZE ||
++	    layout->boot_offset < AS33970_HDR_SIZE ||
++	    layout->boot_offset > firmware->size ||
++	    layout->boot_size > firmware->size - layout->boot_offset ||
++	    layout->system_offset < layout->boot_offset + layout->boot_size ||
++	    layout->system_offset > firmware->size - AS33970_HDR_SIZE ||
++	    memcmp(data + layout->system_offset, "EFSC", 4))
++		return -EINVAL;
++	layout->system_blocks = get_unaligned_le16(data + layout->system_offset +
++						   AS33970_HDR_BLOCKS);
++	if (!layout->system_blocks ||
++	    layout->system_blocks > (firmware->size - layout->system_offset) /
++				    AS33970_BLOCK_SIZE)
++		return -EINVAL;
++	return 0;
++}
++
+ static int as33970_load_firmware(struct as33970_priv *as33970,
+ 				 const struct firmware *firmware)
+ {
+ 	struct i2c_client *client = to_i2c_client(as33970->dev);
++	struct as33970_fw_layout layout;
+ 	u8 reply[20];
+ 	__le32 zero = 0;
+ 	unsigned int block;
+ 	int ret;
+ 
+-	if (firmware->size != AS33970_FW_SIZE ||
+-	    memcmp(firmware->data, "EFLC", 4) ||
+-	    memcmp(firmware->data + AS33970_SYSTEM_OFFSET, "EFSC", 4))
+-		return -EINVAL;
++	ret = as33970_parse_firmware(firmware, &layout);
++	if (ret)
++		return ret;
+ 
+ 	gpiod_set_value_cansleep(as33970->reset, 0);
+ 	msleep(50);
+@@ -276,9 +334,9 @@ static int as33970_load_firmware(struct as33970_priv *as33970,
+ 	if (ret)
+ 		return ret;
+ 
+-	for (block = 0; block < AS33970_BOOT_SIZE / AS33970_BLOCK_SIZE; block++) {
++	for (block = 0; block < layout.boot_size / AS33970_BLOCK_SIZE; block++) {
+ 		ret = as33970_bootloader_block(client,
+-			firmware->data + AS33970_BOOT_OFFSET +
++			firmware->data + layout.boot_offset +
+ 			block * AS33970_BLOCK_SIZE, block);
+ 		if (ret)
+ 			return ret;
+@@ -306,9 +364,8 @@ static int as33970_load_firmware(struct as33970_priv *as33970,
+ 	if (ret)
+ 		return ret;
+ 
+-	for (block = 0; block < AS33970_SYSTEM_SIZE / AS33970_BLOCK_SIZE;
+-	     block++) {
+-		const u8 *data = firmware->data + AS33970_SYSTEM_OFFSET +
++	for (block = 0; block < layout.system_blocks; block++) {
++		const u8 *data = firmware->data + layout.system_offset +
+ 				 block * AS33970_BLOCK_SIZE;
+ 		size_t length = as33970_effective_block_size(data);
+ 		__le16 arguments[2] = {
+@@ -339,6 +396,25 @@ static int as33970_command(struct as33970_priv *as33970, u16 id,
+ 			   u32 module, unsigned int count, const u32 *data,
+ 			   struct as33970_cmd *reply);
+ 
++/* Caller holds the lock. Sets fw_status when the firmware answers. */
++static int as33970_check_firmware(struct as33970_priv *as33970)
++{
++	struct as33970_cmd version;
++	int ret;
++
++	as33970->fw_status = 0;
++	if (as33970_in_rom_loader(as33970))
++		return -ENODEV;
++	ret = as33970_command(as33970, AS33970_CMD_GET(SYS_CMD_VERSION),
++			      AS33970_ARM_ID, 0, NULL, &version);
++	if (ret < 4)
++		return ret < 0 ? ret : -EIO;
++	as33970->fw_status = 1;
++	dev_info(as33970->dev, "firmware %u.%u.%u.%u\n", version.data[0],
++		 version.data[1], version.data[2], version.data[3]);
++	return 0;
++}
++
+ static ssize_t fw_status_show(struct device *dev,
+ 			      struct device_attribute *attr, char *buf)
+ {
+@@ -358,8 +434,16 @@ static ssize_t fw_status_store(struct device *dev,
+ 	ret = kstrtouint(buf, 0, &status);
+ 	if (ret)
+ 		return ret;
+-	as33970->fw_status = !!status;
+-	return count;
++
++	/*
++	 * As in the vendor driver, a userspace loader reports a finished
++	 * download by writing 1 here; believe it only if the firmware answers.
++	 */
++	mutex_lock(&as33970->lock);
++	ret = status ? as33970_check_firmware(as33970) : 0;
++	as33970->fw_status = status && !ret;
++	mutex_unlock(&as33970->lock);
++	return ret ? ret : count;
+ }
+ static DEVICE_ATTR_RW(fw_status);
+ 
+@@ -371,8 +455,11 @@ static ssize_t fw_version_show(struct device *dev,
+ 	int ret;
+ 
+ 	mutex_lock(&as33970->lock);
+-	ret = as33970_command(as33970, AS33970_CMD_GET(SYS_CMD_VERSION),
+-			      AS33970_ARM_ID, 0, NULL, &version);
++	if (as33970_in_rom_loader(as33970))
++		ret = -ENODEV;
++	else
++		ret = as33970_command(as33970, AS33970_CMD_GET(SYS_CMD_VERSION),
++				      AS33970_ARM_ID, 0, NULL, &version);
+ 	mutex_unlock(&as33970->lock);
+ 	if (ret < 4)
+ 		return ret < 0 ? ret : -EIO;
+@@ -382,6 +469,54 @@ static ssize_t fw_version_show(struct device *dev,
+ }
+ static DEVICE_ATTR_RO(fw_version);
+ 
++/*
++ * Explicit, root-only request to send the firmware image to the DSP, the job
++ * of "i2c_load -r -s partition_boot2flash.img" on Android. The driver never
++ * does this on its own.
++ */
++static ssize_t fw_load_store(struct device *dev,
++			     struct device_attribute *attr,
++			     const char *buf, size_t count)
++{
++	struct as33970_priv *as33970 = dev_get_drvdata(dev);
++	const struct firmware *firmware;
++	struct as33970_cmd version;
++	bool load;
++	int ret;
++
++	ret = kstrtobool(buf, &load);
++	if (ret)
++		return ret;
++	if (!load || !as33970->reset)
++		return -EINVAL;
++
++	ret = request_firmware(&firmware, AS33970_FIRMWARE, dev);
++	if (ret)
++		return ret;
++
++	mutex_lock(&as33970->lock);
++	as33970->fw_status = 0;
++	ret = as33970_load_firmware(as33970, firmware);
++	if (ret) {
++		dev_err(dev, "firmware download failed: %d\n", ret);
++		goto unlock;
++	}
++	/* The vendor loader performs this handshake after reboot. */
++	ret = as33970_command(as33970, AS33970_CMD_GET(SYS_CMD_LOADER_VERSION),
++			      AS33970_CTRL_ID, 0, NULL, &version);
++	if (ret < 4) {
++		ret = ret < 0 ? ret : -EIO;
++		dev_err(dev, "firmware startup handshake failed: %d\n", ret);
++		goto unlock;
++	}
++	ret = as33970_check_firmware(as33970);
++unlock:
++	mutex_unlock(&as33970->lock);
++	release_firmware(firmware);
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_WO(fw_load);
++
+ static ssize_t reset_dsp_store(struct device *dev,
+ 			       struct device_attribute *attr,
+ 			       const char *buf, size_t count)
+@@ -408,6 +543,7 @@ static ssize_t reset_dsp_store(struct device *dev,
+ static DEVICE_ATTR_WO(reset_dsp);
+ 
+ static struct attribute *as33970_attrs[] = {
++	&dev_attr_fw_load.attr,
+ 	&dev_attr_fw_status.attr,
+ 	&dev_attr_fw_version.attr,
+ 	&dev_attr_reset_dsp.attr,
+@@ -442,8 +578,8 @@ static int as33970_command(struct as33970_priv *as33970, u16 id,
+ 	memcpy(cmd.data, data, count * sizeof(*data));
+ 	if (id & AS33970_CMD_GET(0))
+ 		cmd.num_words = AS33970_CMD_WORDS;
+-	ret = regmap_bulk_write(as33970->regmap, 4, &raw[1],
+-				cmd.num_words + 1);
++	/* Module ID plus the caller's arguments, as the vendor driver does. */
++	ret = regmap_bulk_write(as33970->regmap, 4, &raw[1], count + 1);
+ 	if (ret)
+ 		return ret;
+ 	ret = regmap_bulk_write(as33970->regmap, 0, raw, 1);
+@@ -545,6 +681,11 @@ static int as33970_startup(struct snd_pcm_substream *substream,
+ 	int ret;
+ 
+ 	mutex_lock(&as33970->lock);
++	if (!as33970->fw_status) {
++		mutex_unlock(&as33970->lock);
++		dev_err(as33970->dev, "no firmware in the DSP, cannot record\n");
++		return -ENODEV;
++	}
+ 	/* Match the downstream driver: establish the AS33970 stream during
+ 	 * startup, before the Q6AFE DAI is prepared and started. */
+ 	ret = as33970_playback(as33970, true);
+@@ -564,8 +705,10 @@ static void as33970_shutdown(struct snd_pcm_substream *substream,
+ 	struct as33970_priv *as33970 = snd_soc_component_get_drvdata(dai->component);
+ 
+ 	mutex_lock(&as33970->lock);
+-	as33970_record(as33970, false);
+-	as33970_playback(as33970, false);
++	if (as33970->fw_status) {
++		as33970_record(as33970, false);
++		as33970_playback(as33970, false);
++	}
+ 	mutex_unlock(&as33970->lock);
+ }
+ 
+@@ -597,8 +740,6 @@ static int as33970_probe(struct i2c_client *client)
+ 		"as33970-vbat", "as33970-avdd13"
+ 	};
+ 	struct as33970_priv *as33970;
+-	struct as33970_cmd version;
+-	const struct firmware *firmware;
+ 	int ret;
+ 
+ 	as33970 = devm_kzalloc(&client->dev, sizeof(*as33970), GFP_KERNEL);
+@@ -613,12 +754,13 @@ static int as33970_probe(struct i2c_client *client)
+ 					     ARRAY_SIZE(supplies), supplies);
+ 	if (ret)
+ 		return dev_err_probe(&client->dev, ret, "failed to enable supplies\n");
+-	as33970->reset = devm_gpiod_get(&client->dev, "reset", GPIOD_OUT_LOW);
++	as33970->reset = devm_gpiod_get_optional(&client->dev, "reset",
++						 GPIOD_OUT_LOW);
+ 	if (IS_ERR(as33970->reset))
+ 		return dev_err_probe(&client->dev, PTR_ERR(as33970->reset), "reset GPIO\n");
+ 	msleep(50);
+ 	gpiod_set_value_cansleep(as33970->reset, 1);
+-	msleep(500);
++	msleep(100);
+ 	as33970->regmap = devm_regmap_init_i2c(client, &as33970_regmap_config);
+ 	if (IS_ERR(as33970->regmap))
+ 		return dev_err_probe(&client->dev, PTR_ERR(as33970->regmap), "regmap\n");
+@@ -627,37 +769,22 @@ static int as33970_probe(struct i2c_client *client)
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = as33970_command(as33970, AS33970_CMD_GET(SYS_CMD_VERSION),
+-			       AS33970_ARM_ID, 0, NULL, &version);
+-	if (ret < 4) {
+-		dev_info(&client->dev, "loading %s\n", AS33970_FIRMWARE);
+-		ret = request_firmware(&firmware, AS33970_FIRMWARE, &client->dev);
+-		if (ret)
+-			return dev_err_probe(&client->dev, ret,
+-					     "failed to request firmware\n");
+-		ret = as33970_load_firmware(as33970, firmware);
+-		release_firmware(firmware);
+-		if (ret)
+-			return dev_err_probe(&client->dev, ret,
+-					     "firmware download failed\n");
+-		/* The vendor loader performs this handshake after reboot. */
+-		ret = as33970_command(as33970,
+-				       AS33970_CMD_GET(SYS_CMD_LOADER_VERSION),
+-				       AS33970_CTRL_ID, 0, NULL, &version);
+-		if (ret < 4)
+-			return dev_err_probe(&client->dev, ret < 0 ? ret : -EIO,
+-					     "firmware startup handshake failed\n");
+-		ret = as33970_command(as33970, AS33970_CMD_GET(SYS_CMD_VERSION),
+-				       AS33970_ARM_ID, 0, NULL, &version);
+-	}
+-	if (ret >= 4) {
+-		as33970->fw_status = 1;
+-		dev_info(&client->dev, "firmware %u.%u.%u.%u\n", version.data[0],
+-			 version.data[1], version.data[2], version.data[3]);
+-	} else {
+-		return dev_err_probe(&client->dev, ret < 0 ? ret : -EIO,
+-				     "firmware did not start\n");
+-	}
++	/*
++	 * Never download anything from here. Without firmware the DAI is still
++	 * registered, so that the sound card (speakers, WCD938x microphones)
++	 * comes up; opening the capture stream then fails with -ENODEV until
++	 * an image has been loaded through fw_load or by a userspace loader.
++	 */
++	mutex_lock(&as33970->lock);
++	ret = as33970_check_firmware(as33970);
++	mutex_unlock(&as33970->lock);
++	if (ret == -ENODEV)
++		dev_info(&client->dev,
++			 "ROM loader is waiting for firmware, capture disabled\n");
++	else if (ret)
++		dev_warn(&client->dev, "DSP does not answer (%d), capture disabled\n",
++			 ret);
++
+ 	return devm_snd_soc_register_component(&client->dev, &as33970_component,
+ 					       &as33970_dai, 1);
+ }

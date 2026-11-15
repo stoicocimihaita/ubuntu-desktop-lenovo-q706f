@@ -1,0 +1,141 @@
+#!/usr/bin/python3
+"""q706f-mark-boot-successful: mark the running A/B slot as "boot successful".
+
+Qualcomm ABL keeps the A/B state in the GPT attribute bits of the boot_a / boot_b
+partition entries (bits 48-49 priority, 50 active, 51-53 retry count, 54 successful,
+55 unbootable). On every boot of a slot that is not marked successful ABL decrements its
+retry count; at 0 it marks the slot unbootable and switches to the other slot. Android
+(boot_control HAL / update_engine) sets "successful" after a good boot; nothing in this
+Ubuntu port did, so the counter ran down.
+
+This tool changes ONLY the attribute word of the boot_<slot> entry of the running slot:
+it sets bit 54 (successful) and resets the retry count to 7. It updates the CRC32 of the
+partition-entry array and of the header, for the primary GPT and the backup GPT, after
+saving a copy of both GPT areas to /var/lib/q706f/gpt-backups/. It refuses to write if
+anything does not validate (signature, CRCs, primary/backup entries identical, exactly one
+boot_<slot> entry, running slot from the kernel command line) and re-reads and validates
+everything afterwards.  Usage: q706f-mark-boot-successful [--dry-run]
+Rollback: dd the saved primary/backup areas back (the paths and offsets are printed).
+"""
+import os
+import struct
+import sys
+import time
+import zlib
+
+DRY = "--dry-run" in sys.argv
+SUCCESS = 1 << 54
+RETRY_SHIFT, RETRY_MASK = 51, 0x7 << 51
+UNBOOTABLE = 1 << 55
+BACKUP_DIR = "/var/lib/q706f/gpt-backups"
+
+
+def die(msg):
+    print("q706f-mark-boot-successful: " + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def slot_suffix():
+    for tok in open("/proc/cmdline").read().split():
+        if tok.startswith("androidboot.slot_suffix="):
+            return tok.split("=", 1)[1]
+    die("no androidboot.slot_suffix on the kernel command line")
+
+
+def read_gpt(f, lba, lbs):
+    f.seek(lba * lbs)
+    hdr = f.read(lbs)
+    if hdr[:8] != b"EFI PART":
+        die(f"no GPT header at LBA {lba}")
+    hsize = struct.unpack_from("<I", hdr, 12)[0]
+    hcrc = struct.unpack_from("<I", hdr, 16)[0]
+    h = bytearray(hdr[:hsize])
+    struct.pack_into("<I", h, 16, 0)
+    if zlib.crc32(h) & 0xFFFFFFFF != hcrc:
+        die(f"header CRC mismatch at LBA {lba}")
+    my_lba, alt_lba = struct.unpack_from("<QQ", hdr, 24)
+    ent_lba, n, esz, ecrc = struct.unpack_from("<QIII", hdr, 72)
+    f.seek(ent_lba * lbs)
+    ents = f.read(n * esz)
+    if zlib.crc32(ents) & 0xFFFFFFFF != ecrc:
+        die(f"entry-array CRC mismatch (header at LBA {lba})")
+    return dict(hdr=bytearray(hdr), hsize=hsize, my=my_lba, alt=alt_lba,
+                ent_lba=ent_lba, n=n, esz=esz, ents=bytearray(ents))
+
+
+def main():
+    if os.geteuid() != 0:
+        die("must run as root")
+    suf = slot_suffix()
+    if suf not in ("_a", "_b"):
+        die(f"unexpected slot suffix {suf!r}")
+    name = "boot" + suf
+    part = os.path.realpath(f"/dev/disk/by-partlabel/{name}")
+    pbase = os.path.basename(part)
+    disk = os.path.basename(os.path.realpath(f"/sys/class/block/{pbase}/.."))
+    partno = int(open(f"/sys/class/block/{pbase}/partition").read())
+    lbs = int(open(f"/sys/block/{disk}/queue/logical_block_size").read())
+    dev = f"/dev/{disk}"
+
+    with open(dev, "rb") as f:
+        pri = read_gpt(f, 1, lbs)
+        bak = read_gpt(f, pri["alt"], lbs)
+        if pri["ents"] != bak["ents"]:
+            die("primary and backup partition entries differ; not touching anything")
+        esz = pri["esz"]
+        hits = [i for i in range(pri["n"])
+                if pri["ents"][i*esz+56:i*esz+128].decode("utf-16le").rstrip("\x00") == name]
+        if hits != [partno - 1]:
+            die(f"expected exactly one {name} entry at index {partno-1}, found {hits}")
+        off = hits[0] * esz + 48
+        attr = struct.unpack_from("<Q", pri["ents"], off)[0]
+        state = (f"{name}: successful={(attr >> 54) & 1} retry={(attr >> 51) & 7} "
+                 f"unbootable={(attr >> 55) & 1} active={(attr >> 50) & 1}")
+        if attr & UNBOOTABLE:
+            die(state + ": marked unbootable while running from it; leaving it to the user")
+        new = (attr | SUCCESS) & ~RETRY_MASK | (7 << RETRY_SHIFT)
+        if new == attr:
+            print(state + " (already marked, nothing to do)")
+            return
+        print(state + f" -> successful=1 retry=7 (attr 0x{attr:016x} -> 0x{new:016x})")
+        if DRY:
+            print("dry run: nothing written")
+            return
+        # Save both GPT areas (header LBA + entry array) before writing.
+        os.makedirs(BACKUP_DIR, mode=0o700, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        for tag, g in (("primary", pri), ("backup", bak)):
+            for what, lba, size in (("hdr", g["my"], lbs), ("ents", g["ent_lba"], g["n"] * esz)):
+                f.seek(lba * lbs)
+                data = f.read(size)
+                path = f"{BACKUP_DIR}/{disk}-{tag}-{what}-lba{lba}-{stamp}.bin"
+                with open(path, "wb") as o:
+                    o.write(data)
+                print(f"saved {path} (dd of={dev} bs={lbs} seek={lba})")
+
+    ents = bytearray(pri["ents"])
+    struct.pack_into("<Q", ents, off, new)
+    ecrc = zlib.crc32(ents) & 0xFFFFFFFF
+    with open(dev, "r+b") as f:
+        for g in (pri, bak):
+            h = bytearray(g["hdr"][:g["hsize"]])
+            struct.pack_into("<I", h, 88, ecrc)
+            struct.pack_into("<I", h, 16, 0)
+            struct.pack_into("<I", h, 16, zlib.crc32(h) & 0xFFFFFFFF)
+            f.seek(g["ent_lba"] * lbs)
+            f.write(ents)
+            f.seek(g["my"] * lbs)
+            f.write(h)
+        f.flush()
+        os.fsync(f.fileno())
+    os.system(f"blockdev --flushbufs {dev} >/dev/null 2>&1")
+    with open(dev, "rb") as f:
+        p2 = read_gpt(f, 1, lbs)
+        b2 = read_gpt(f, p2["alt"], lbs)
+        a2 = struct.unpack_from("<Q", p2["ents"], off)[0]
+        if p2["ents"] != b2["ents"] or a2 != new:
+            die("verification after write FAILED - restore from the saved copies")
+    print(f"{name} marked successful (verified primary and backup GPT)")
+
+
+main()

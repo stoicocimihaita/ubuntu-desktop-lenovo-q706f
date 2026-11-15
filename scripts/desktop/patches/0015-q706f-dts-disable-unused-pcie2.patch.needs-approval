@@ -1,0 +1,33 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] q706f: dts: disable the unused PCIe2 (modem) root port
+
+lspci shows only the root bridge on domain 0002; the controller is
+runtime-active with gcc_pcie_2_* clocks, the QMP PHY and pcie_2_gdsc on.
+qcom-pcie powers a link-less controller down in suspend_noirq, so this is
+an awake/idle saving, not an s2idle one.
+
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+@@ -1253,14 +1253,20 @@
+ 	};
+ };
+ 
++/*
++ * PCIe2 is the SDX55 modem link of the 5G variant (TB-Q706Z). Nothing is
++ * attached on the Wi-Fi-only TB-Q706F: the root port has no device behind it,
++ * yet the controller, its PHY, eight GCC clocks and pcie_2_gdsc stay active
++ * for as long as the tablet is awake. Re-enable for TB-Q706Z modem work.
++ */
+ &pcie2 {
+-	status = "okay";
++	status = "disabled";
+ };
+ 
+ &pcie2_phy {
+ 	vdda-phy-supply = <&vreg_l5a_0p88>;
+ 	vdda-pll-supply = <&vreg_l9a_1p2>;
+-	status = "okay";
++	status = "disabled";
+ };
+ 
+ &pm8150b_adc {

@@ -1,0 +1,4 @@
+# QCA6390 Wi-Fi (ath11k_pci): set the device MAC address and the regulatory
+# domain hint when the interface is created. udev runs these before the event
+# reaches NetworkManager, and the interface is still down at this point.
+ACTION=="add", SUBSYSTEM=="net", ENV{DEVTYPE}=="wlan", DRIVERS=="ath11k_pci", RUN+="/usr/local/sbin/q706f-wifi-addr", RUN+="/usr/local/sbin/q706f-regdom"

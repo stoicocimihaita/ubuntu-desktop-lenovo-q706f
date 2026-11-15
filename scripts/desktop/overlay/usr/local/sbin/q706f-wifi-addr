@@ -1,0 +1,61 @@
+#!/bin/sh
+# ath11k has no MAC address for the QCA6390 on mainline (the generic board data
+# carries none, the factory one lives in Android storage), so the interface comes
+# up with the generic Atheros address 00:03:7f:xx:xx:xx.
+#
+# Address source: /etc/q706f-wifi-addr (one line, XX:XX:XX:XX:XX:XX, root-only;
+# put the factory address there -- Android: getprop ro.odm.lenovo.wifiaddr) if
+# present, else a stable locally-administered address derived from the device
+# serial number.
+#
+# Run by udev when the interface is added (83-q706f-wifi.rules), i.e. before
+# NetworkManager gets to see the device, so NM records this address as the
+# device's own and its "preserve" policy keeps it.
+#
+# The address is only ever changed while the interface is administratively DOWN
+# and this script never brings it down: running it by hand on a connected
+# system is a no-op (the change then applies at the next boot / driver reload).
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+log() { echo "q706f-wifi-addr: $*"; logger -t q706f-wifi-addr -- "$*" 2>/dev/null; }
+
+# Test hook: Q706F_WIFI_IFACE=dummy0 exercises the logic on a dummy interface.
+IF=${Q706F_WIFI_IFACE:-}
+if [ -z "$IF" ]; then
+  for d in /sys/class/net/*; do
+    [ -e "$d/phy80211" ] || continue
+    case "$(readlink -f "$d/device/driver" 2>/dev/null)" in
+      */ath11k_pci) IF=${d##*/}; break ;;
+    esac
+  done
+fi
+[ -n "$IF" ] && [ -e "/sys/class/net/$IF" ] || { log "no ath11k interface"; exit 0; }
+
+F=${Q706F_WIFI_ADDR_FILE:-/etc/q706f-wifi-addr}
+A=
+[ -s "$F" ] && A=$(tr -d ' \t\r\n' <"$F" | tr A-F a-f)
+if ! echo "$A" | grep -Eq '^([0-9a-f]{2}:){5}[0-9a-f]{2}$' ||
+   echo "$A" | grep -Eq '^(.[13579bdf]|00:00:00:00:00:00)'; then
+  [ -n "$A" ] && log "ignoring malformed or multicast address in $F"
+  S=$(sed -n 's/.*androidboot\.serialno=\([^ ]*\).*/\1/p' /proc/cmdline)
+  H=$(printf '%s' "${S:-q706f}-wifi" | sha256sum | cut -c1-10)
+  A="02:$(echo "$H" | sed 's/../&:/g; s/:$//')"
+  SRC="derived from the serial number"
+else
+  SRC="from $F"
+fi
+
+C=$(cat "/sys/class/net/$IF/address" 2>/dev/null)
+[ "$C" = "$A" ] && exit 0
+
+FLAGS=$(cat "/sys/class/net/$IF/flags" 2>/dev/null || echo 0x1)
+if [ $((FLAGS & 1)) -ne 0 ]; then
+  log "$IF is up: address left unchanged, will be set at the next boot"
+  exit 0
+fi
+
+if ip link set dev "$IF" address "$A"; then
+  log "$IF: address set ($SRC)"
+else
+  log "$IF: could not set the address"
+fi
+exit 0

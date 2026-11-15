@@ -1,0 +1,54 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: iio-sensor-proxy 3.9: broadcast sensor presence (q706f)
+
+Patch for iio-sensor-proxy 3.9 (https://gitlab.freedesktop.org/hadess/iio-sensor-proxy),
+applied by scripts/desktop/setup-sensors.sh with 'git apply'. Same licence as
+iio-sensor-proxy (GPL-3.0).
+---
+--- a/src/iio-sensor-proxy.c
++++ b/src/iio-sensor-proxy.c
+@@ -373,6 +373,36 @@
+ 	g_hash_table_destroy (ht);
+ }
+ 
++/* PropertiesChanged is otherwise only sent to clients that claimed a sensor.
++ * Sensors are discovered after the bus name is acquired, so a client that
++ * read the properties as soon as the name appeared (Mutter does, whenever
++ * this daemon starts after the session) saw Has*=FALSE and would never learn
++ * otherwise. Broadcast the presence properties once discovery is done. */
++static void
++broadcast_sensor_presence (SensorData *data)
++{
++	GVariantBuilder props_builder;
++
++	g_variant_builder_init (&props_builder, G_VARIANT_TYPE ("a{sv}"));
++	g_variant_builder_add (&props_builder, "{sv}", "HasAccelerometer",
++			       g_variant_new_boolean (driver_type_exists (data, DRIVER_TYPE_ACCEL)));
++	g_variant_builder_add (&props_builder, "{sv}", "HasAmbientLight",
++			       g_variant_new_boolean (driver_type_exists (data, DRIVER_TYPE_LIGHT)));
++	g_variant_builder_add (&props_builder, "{sv}", "HasProximity",
++			       g_variant_new_boolean (driver_type_exists (data, DRIVER_TYPE_PROXIMITY)));
++
++	g_dbus_connection_emit_signal (data->connection,
++				       NULL,
++				       SENSOR_PROXY_DBUS_PATH,
++				       "org.freedesktop.DBus.Properties",
++				       "PropertiesChanged",
++				       g_variant_new ("(s@a{sv}@as)",
++						      SENSOR_PROXY_IFACE_NAME,
++						      g_variant_builder_end (&props_builder),
++						      g_variant_new_strv (NULL, 0)),
++				       NULL);
++}
++
+ static void
+ send_driver_changed_dbus_event (SensorData   *data,
+ 				DriverType    driver_type)
+@@ -793,6 +823,7 @@
+ 
+ 	send_dbus_event (data, PROP_ALL);
+ 	send_dbus_event (data, PROP_ALL_COMPASS);
++	broadcast_sensor_presence (data);
+ 	return;
+ 
+ bail:

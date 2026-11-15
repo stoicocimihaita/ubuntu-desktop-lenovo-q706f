@@ -1,0 +1,3 @@
+# The internal UFS holds the Android/bootloader partitions (persist, modem, xbl, ...).
+# Keep them out of the desktop: no icons, no automount, no accidental formatting.
+SUBSYSTEM=="block", KERNEL=="sd[a-f]*", ENV{ID_PATH}=="platform-1d84000.ufshc*", ENV{UDISKS_IGNORE}="1"

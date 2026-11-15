@@ -1,0 +1,16 @@
+[Unit]
+Description=Generate the ssh host keys on the first boot of the image (q706f)
+# The image ships without host keys (rootfs-customize.sh removes them) so that every
+# installed tablet gets its own. The stock sshd-keygen.service is not enough: it only
+# runs on ConditionFirstBoot, which an image with an empty /etc/machine-id never meets.
+ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
+# Not ordered against ssh.socket: that one is part of sockets.target (ordering cycle).
+Before=ssh.service sshd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/ssh-keygen -A
+
+[Install]
+WantedBy=multi-user.target

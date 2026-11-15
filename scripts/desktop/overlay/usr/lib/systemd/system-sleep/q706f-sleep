@@ -1,0 +1,35 @@
+#!/bin/sh
+# systemd-sleep hook for q706f ($1 = pre|post).
+# - The sensor DSP (SLPI) crashes on resume if the FastRPC daemon was left attached, and
+#   the sensor services then stay down: stop them before sleeping, start them after.
+# - End a pen wireless-charging session cleanly (an interrupted one can corrupt the pen's
+#   NFC tag) and restart detection on resume.
+# - Honour a wake-up request that came too late to cancel the suspend.
+# - Switch Bluetooth off while asleep (BT_OFF_IN_SLEEP in /etc/default/q706f-sleep):
+#   the controller kept the pen's BLE link up and cost ~12 mA in suspend
+#   (103 vs 115 mA, 15 min tests on 15.11.2026). The pen reconnects after resume.
+BT_OFF_IN_SLEEP=1
+[ -r /etc/default/q706f-sleep ] && . /etc/default/q706f-sleep
+BT_MARK=/run/q706f-bt-off-in-sleep
+case "$1" in
+  pre)
+    systemctl stop iio-sensor-proxy.service hexagonrpcd.service 2>/dev/null
+    [ -e /sys/class/misc/ctn730/enable ] && echo 0 > /sys/class/misc/ctn730/enable
+    if [ "$BT_OFF_IN_SLEEP" = 1 ] && rfkill list bluetooth | grep -q 'Soft blocked: no'; then
+      rfkill block bluetooth && touch $BT_MARK
+    fi
+    sleep 1
+    # The user asked for the screen (cover opened, power key) after the suspend had
+    # already started: q706f-screen-keys left a marker. Wake up again in 2 s.
+    for f in /run/user/*/q706f-wake-intent; do
+      [ -e "$f" ] && { echo 0 > /sys/class/rtc/rtc0/wakealarm; echo +2 > /sys/class/rtc/rtc0/wakealarm; break; }
+    done 2>/dev/null
+    ;;
+  post)
+    [ -e $BT_MARK ] && { rm -f $BT_MARK; rfkill unblock bluetooth; }
+    [ -e /sys/class/misc/ctn730/enable ] && echo 1 > /sys/class/misc/ctn730/enable
+    systemctl start hexagonrpcd.service 2>/dev/null
+    systemctl --no-block start iio-sensor-proxy.service 2>/dev/null
+    ;;
+esac
+exit 0

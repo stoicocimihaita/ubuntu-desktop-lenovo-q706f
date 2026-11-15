@@ -1,0 +1,11 @@
+# *** NOT MERGED: append to q706f-desktop.config only with owner approval ***
+#
+# The QCA6390 phy is self-managed: ath11k ignores "iw reg set" (and therefore
+# /usr/local/sbin/q706f-regdom) unless the kernel is built with the two options
+# below; the phy then stays on the firmware/board-data default country (US with
+# the generic board data: no 2.4 GHz channels 12-13, FCC instead of ETSI power
+# limits). CONFIG_EXPERT=y, which CFG80211_CERTIFICATION_ONUS depends on, is
+# already set. With these options the user (not the vendor) is responsible for
+# regulatory compliance: /etc/default/q706f-regdom must name the real country.
+CONFIG_CFG80211_CERTIFICATION_ONUS=y
+CONFIG_ATH_REG_DYNAMIC_USER_REG_HINTS=y

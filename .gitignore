@@ -1,0 +1,21 @@
+# Build output, downloaded sources and anything proprietary: never committed.
+/out/
+/sources/
+/backup/
+/logs/
+/firmware/
+*.img
+*.bin
+*.mbn
+*.zip
+.ccache/
+
+# Out-of-tree kernel module build products
+*.o
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+Module.symvers
+modules.order
+.module-common.o

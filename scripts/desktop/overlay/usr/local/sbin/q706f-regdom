@@ -1,0 +1,52 @@
+#!/bin/sh
+# Give cfg80211/ath11k the regulatory domain of the country the tablet is used in.
+# Configuration: /etc/default/q706f-regdom (REGDOM=auto|<ISO 3166 alpha-2>|off).
+# "auto" maps the system timezone to a country with tzdata's zone.tab.
+#
+# Run by udev when the Wi-Fi interface is added (83-q706f-wifi.rules), before
+# NetworkManager connects. It can also be run by hand, but changing the country
+# while associated may drop the connection.
+#
+# NOTE: the QCA6390 phy is "self-managed" in ath11k: the firmware owns the
+# regulatory domain and the driver only forwards this hint when the kernel has
+# CONFIG_ATH_REG_DYNAMIC_USER_REG_HINTS=y (needs CFG80211_CERTIFICATION_ONUS).
+# Without it only the global cfg80211 domain changes and the phy keeps the
+# firmware default. Check with: iw reg get
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+log() { echo "q706f-regdom: $*"; logger -t q706f-regdom -- "$*" 2>/dev/null; }
+
+REGDOM=auto
+[ -r /etc/default/q706f-regdom ] && . /etc/default/q706f-regdom
+
+case "$REGDOM" in
+  off|OFF|"") exit 0 ;;
+  auto|AUTO)
+    TZN=$(readlink -f /etc/localtime 2>/dev/null | sed -n 's|^.*/zoneinfo/||p')
+    [ -z "$TZN" ] && [ -r /etc/timezone ] && TZN=$(head -n1 /etc/timezone)
+    CC=
+    [ -n "$TZN" ] && CC=$(awk -F'\t' -v z="$TZN" '!/^#/ && $3 == z { print $1; exit }' \
+      /usr/share/zoneinfo/zone.tab 2>/dev/null)
+    [ -z "$CC" ] && { log "no country for timezone '${TZN:-unknown}', leaving the domain alone"; exit 0; }
+    ;;
+  *) CC=$(printf '%s' "$REGDOM" | tr a-z A-Z) ;;
+esac
+echo "$CC" | grep -Eq '^[A-Z]{2}$' || { log "invalid REGDOM '$REGDOM'"; exit 0; }
+
+[ "${1:-}" = "--print" ] && { echo "$CC"; exit 0; }
+
+# From udev, only act on a freshly created (still down) interface, so that a
+# replayed "add" event cannot change the country under a live connection.
+if [ -n "${ACTION:-}" ]; then
+  for f in /sys/class/net/*/phy80211; do
+    [ -e "$f" ] || continue
+    FL=$(cat "${f%/phy80211}/flags" 2>/dev/null || echo 0x0)
+    [ $((FL & 1)) -ne 0 ] && { log "${f%/phy80211} is up, hint $CC deferred to the next boot"; exit 0; }
+  done
+fi
+
+if iw reg set "$CC"; then
+  log "regulatory hint: $CC"
+else
+  log "iw reg set $CC failed"
+fi
+exit 0

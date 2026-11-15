@@ -1,0 +1,10 @@
+#!/bin/sh
+# systemd-sleep hook (q706f): log battery charge and SoC sleep counters at every
+# suspend entry/exit, so the real s2idle drain can be computed afterwards.
+# Output: /var/log/q706f-sleep-power.log (one line per pre/post). Read-only otherwise.
+P=/sys/class/power_supply
+S=/sys/kernel/debug/qcom_stats
+[ -d $S ] || modprobe qcom_stats 2>/dev/null
+c() { head -1 "$S/$1" 2>/dev/null | tr -dc 0-9; }
+echo "$(date +%s) $(date '+%F %T') $1 kernel=$(uname -r) charge_uAh=$(cat $P/bq27541-0/charge_now 2>/dev/null) cap=$(cat $P/bq27541-0/capacity 2>/dev/null)% usb=$(cat $P/pm8150b-charger/online 2>/dev/null) cxsd=$(c cxsd) aosd=$(c aosd) ddr=$(c ddr) adsp=$(c adsp) cdsp=$(c cdsp) slpi=$(c slpi)" >> /var/log/q706f-sleep-power.log
+exit 0

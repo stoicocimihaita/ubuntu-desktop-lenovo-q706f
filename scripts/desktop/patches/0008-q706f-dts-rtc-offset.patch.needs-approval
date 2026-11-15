@@ -1,0 +1,51 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] q706f: store the RTC offset in PM8150 SDAM2 (0xb1bc..0xb1bf)
+
+*** DO NOT APPLY WITHOUT OWNER APPROVAL ***
+
+rtc-pm8xxx cannot set the PMIC RTC counter, so the clock starts in 1970.
+Give it an nvmem "offset" cell, as sc8280xp boards do with PMK8280 SDAM6
+byte 0xbc. No upstream SM8150/SM8250 board does this on PM8150, so the
+cell location is our choice, not an established one: SDAM2 (0xb100),
+bytes 0xbc-0xbf. The vendor kernel only touches 0x42, 0x80-0x94, 0xe5,
+0xe6 of that block, and on this unit 0x95-0xbf hold what looks like
+never-initialised data, but boot firmware/PBS use of those bytes cannot
+be ruled out from the sources we have. The write is persistent while the
+PMIC has battery power and is shared with Android on the other slot.
+
+Needs CONFIG_NVMEM_SPMI_SDAM (=m is enough, the RTC probe defers).
+
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+@@ -1317,6 +1317,31 @@
+ 	status = "disabled";
+ };
+ 
++&pm8150_0 {
++	/*
++	 * The PMIC RTC counter is not written by Linux. Keep the offset to
++	 * wall-clock time in four otherwise unused bytes of PM8150 SDAM2.
++	 * The vendor kernel uses this block for fg-gen4 data (0x80-0x94) and
++	 * PBS triggers for the LED driver (0x42, 0xe5, 0xe6) only.
++	 */
++	rtc@6000 {
++		nvmem-cells = <&rtc_offset>;
++		nvmem-cell-names = "offset";
++	};
++
++	pm8150_sdam_2: nvram@b100 {
++		compatible = "qcom,spmi-sdam";
++		reg = <0xb100>;
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges = <0 0xb100 0x100>;
++
++		rtc_offset: rtc-offset@bc {
++			reg = <0xbc 0x4>;
++		};
++	};
++};
++
+ &pm8150_gpios {
+ 	gpio-line-names = "NC", /* GPIO_1 */
+ 	"NC",

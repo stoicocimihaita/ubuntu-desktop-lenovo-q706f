@@ -1,0 +1,11 @@
+[Unit]
+Description=Bring the microphone source up if WirePlumber probed the codec too early (q706f)
+After=wireplumber.service pipewire.service
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/q706f-audio-settle
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,4 @@
+# Read by /usr/lib/systemd/system-sleep/q706f-sleep
+# 1 = switch Bluetooth off during suspend (saves ~12 mA; the pen reconnects after wake)
+# 0 = keep Bluetooth on while asleep
+BT_OFF_IN_SLEEP=1

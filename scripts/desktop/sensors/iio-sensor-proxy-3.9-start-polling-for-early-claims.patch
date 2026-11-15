@@ -1,0 +1,25 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: iio-sensor-proxy 3.9: start polling for early claims (q706f)
+
+Patch for iio-sensor-proxy 3.9 (https://gitlab.freedesktop.org/hadess/iio-sensor-proxy),
+applied by scripts/desktop/setup-sensors.sh with 'git apply'. Same licence as
+iio-sensor-proxy (GPL-3.0).
+---
+diff --git a/src/iio-sensor-proxy.c b/src/iio-sensor-proxy.c
+index 9c7e8cd..9d84e9e 100644
+--- a/src/iio-sensor-proxy.c
++++ b/src/iio-sensor-proxy.c
+@@ -779,6 +779,13 @@ name_acquired_handler (GDBusConnection *connection,
+ 		}
+ 
+ 		DEVICE_FOR_TYPE(i) = sensor_device;
++
++		/* Sensor discovery can iterate the main loop (e.g. the synchronous
++		 * libssc calls), so a client may already have claimed this sensor
++		 * before its driver existed. Start polling for such clients, like
++		 * sensor_changes() does for hotplugged sensors. */
++		if (g_hash_table_size (data->clients[i]) > 0)
++			driver_set_polling (sensor_device, TRUE);
+ 	}
+ 
+ 	if (!any_sensors_left (data))

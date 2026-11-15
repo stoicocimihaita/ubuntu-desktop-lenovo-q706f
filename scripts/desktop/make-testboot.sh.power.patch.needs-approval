@@ -1,0 +1,40 @@
+make-testboot.sh: allow overriding the bring-up command line
+
+BASE_CMDLINE replaces the default "console=tty0 clk_ignore_unused pd_ignore_unused
+loglevel=7 rdinit=/init" so that power test images can be packed without the
+bring-up flags. Default behaviour is unchanged. Test images are only ever
+`fastboot boot`-ed; boot_a keeps the Linux 7.3.4 kernel (release 7.3.4).
+On 7.3.4 CONFIG_FW_DEVLINK_SYNC_STATE_TIMEOUT=y is already set, so the
+fw_devlink.sync_state=timeout word of P1 is redundant there (harmless).
+The 7.3.4 power images built without this patch are described in
+out/desktop/kernel-power/TEST.md (ubuntu-boot-power-A/A1/A2.img).
+
+Variants (each: OUT_NAME=testboot-pwrN.img, then `fastboot boot out/desktop/testboot-pwrN.img`):
+  P1  EXTRA_CMDLINE="q706f.rootimg=ubuntu-desktop.img fw_devlink.sync_state=timeout"
+      (no BASE_CMDLINE; works with the unpatched script too)
+  P2  P1 + BASE_CMDLINE="console=tty0 clk_ignore_unused loglevel=7 rdinit=/init"
+      (drops pd_ignore_unused: boot-on domains without a consumer are switched off at
+       late_initcall / after sync_state: ufs_card_gdsc, pcie_2_gdsc once 0015 is in,
+       hlos1_vote_mmnoc_mmu_tbu_*; all devices in use have their power-domains in DT)
+  P3  P1 + BASE_CMDLINE="console=tty0 loglevel=7 rdinit=/init"
+      (also drops clk_ignore_unused: gates boot-on clocks without a consumer, e.g.
+       gcc_ufs_card_*, gcc_ufs_phy_ice_core_clk, gcc_prng_ahb_clk, gcc_npu_cfg_ahb_clk,
+       gcc_qupv3_wrap2_core*, disp_cc_mdss_rscc_*, cam/video divider clocks. Highest
+       risk of the three: black screen or a hang ~at "clk: Disabling unused clocks".
+       RPMh clocks (ln_bb_clk*, rf_clk*) are not touched: clk-rpmh has no is_prepared.)
+Recovery for any of them: hold Power ~10 s; the tablet boots 7.3.4 from boot_a.
+If ABL then stays in fastboot: `fastboot set_active a` + `fastboot reboot`.
+
+--- a/scripts/desktop/make-testboot.sh
++++ b/scripts/desktop/make-testboot.sh
+@@ -32,7 +32,9 @@
+ (cd "$W" && find . | cpio -o -H newc --quiet | gzip -9) > "$ROOT/out/desktop/initramfs.cpio.gz"
+ 
+ # EXTRA_CMDLINE="q706f.rootimg=ubuntu-desktop.img" boots the rootfs image from userdata.
+-CMDLINE="console=tty0 clk_ignore_unused pd_ignore_unused loglevel=7 rdinit=/init ${EXTRA_CMDLINE:-}"
++# BASE_CMDLINE replaces the bring-up defaults (power tests without *_ignore_unused).
++BASE_CMDLINE="${BASE_CMDLINE:-console=tty0 clk_ignore_unused pd_ignore_unused loglevel=7 rdinit=/init}"
++CMDLINE="$BASE_CMDLINE ${EXTRA_CMDLINE:-}"
+ NAME="${OUT_NAME:-testboot.img}"
+ # Header v0 with the DTB appended to Image.gz, like pmOS device-lenovo-q706f.
+ # The Lenovo ABL refuses a mainline DTB passed in the header-v2 dtb field

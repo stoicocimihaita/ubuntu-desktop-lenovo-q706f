@@ -1,0 +1,233 @@
+#!/usr/bin/python3
+"""q706f-screen-keys: tablet-style power button and cover handling for GNOME.
+
+Runs inside the user's graphical session (systemd user unit).
+
+  power button, short press : screen off (GNOME screen shield + blank), or
+                              wake up if the screen is already off
+  power button, held >= 1.2s: GNOME power-off dialog
+  cover closed (SW_LID)     : screen off;  cover opened: screen on
+
+Real suspend has ONE switch: /etc/systemd/sleep.conf.d/10-q706f-suspend.conf.
+While it says AllowSuspend=no (logind CanSuspend != "yes") the tablet only
+blanks.  Set AllowSuspend=yes there (no restart needed) and a short press /
+closing the cover also suspends (s2idle) after blanking.
+
+GNOME's own handling must be off (power-button-action='nothing', logind
+HandlePowerKey/HandleLidSwitch=ignore), see 90_q706f.gschema.override.
+"""
+import fcntl
+import glob
+import os
+import struct
+import time
+
+from gi.repository import Gio, GLib
+
+EV_KEY, EV_SW, KEY_POWER, SW_LID = 1, 5, 116, 0
+EVENT = struct.Struct("qqHHi")
+LONG_PRESS_MS = 1200
+# The screen blanks at once; the suspend itself waits this long, so that opening the
+# cover again (or a second press) right away simply cancels it.
+SUSPEND_DELAY_MS = 3000
+# Written when the user asks for the screen while a suspend is already under way (it
+# cannot be cancelled any more): the q706f-sleep hook then arms a 2 s RTC alarm, and we
+# turn the screen on as soon as the tablet is back.
+WAKE_INTENT = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid()),
+                           "q706f-wake-intent")
+DEVICES = {"pm8941_pwrkey": "power", "Hall effect sensor": "lid"}
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+class ScreenKeys:
+    def __init__(self):
+        self.session = Gio.bus_get_sync(Gio.BusType.SESSION)
+        self.system = Gio.bus_get_sync(Gio.BusType.SYSTEM)
+        self.long_press_id = 0
+        self.long_press_fired = False
+        # Suspended time shows up as a jump of CLOCK_BOOTTIME over CLOCK_MONOTONIC. A
+        # power-button press that arrives right after such a jump is the press that
+        # woke the tablet: it must turn the screen on, not blank it again.
+        self.sleep_offset = self.suspended_time()
+        self.resume_at = -10.0
+        self.wake_press = False
+        self.suspend_id = 0
+        self.suspending = False
+        self.clear_wake_intent()
+        GLib.timeout_add_seconds(1, self.watch_resume)
+        self.open_devices()
+
+    @staticmethod
+    def suspended_time():
+        return time.clock_gettime(time.CLOCK_BOOTTIME) - time.clock_gettime(time.CLOCK_MONOTONIC)
+
+    def resumed_just_now(self):
+        offset = self.suspended_time()
+        if offset - self.sleep_offset > 0.5:
+            self.sleep_offset = offset
+            self.resume_at = time.monotonic()
+            self.suspending = False
+            if os.path.exists(WAKE_INTENT):
+                self.clear_wake_intent()
+                self.screen_on("requested while suspending")
+        return time.monotonic() - self.resume_at < 2.0
+
+    def watch_resume(self):
+        self.resumed_just_now()
+        return GLib.SOURCE_CONTINUE
+
+    # -- D-Bus helpers ------------------------------------------------------
+    def call(self, bus, name, path, iface, method, args=None):
+        try:
+            return bus.call_sync(name, path, iface, method, args, None,
+                                 Gio.DBusCallFlags.NONE, 5000, None)
+        except GLib.Error as e:
+            log("%s.%s failed: %s" % (iface, method, e.message))
+            return None
+
+    def screensaver(self, method, args=None):
+        return self.call(self.session, "org.gnome.ScreenSaver", "/org/gnome/ScreenSaver",
+                         "org.gnome.ScreenSaver", method, args)
+
+    def logind(self, method, args=None):
+        return self.call(self.system, "org.freedesktop.login1", "/org/freedesktop/login1",
+                         "org.freedesktop.login1.Manager", method, args)
+
+    def screen_is_off(self):
+        r = self.screensaver("GetActive")
+        return bool(r and r.unpack()[0])
+
+    def suspend_enabled(self):
+        r = self.logind("CanSuspend")
+        return bool(r and r.unpack()[0] == "yes")
+
+    @staticmethod
+    def clear_wake_intent():
+        try:
+            os.unlink(WAKE_INTENT)
+        except OSError:
+            pass
+
+    # -- actions ------------------------------------------------------------
+    def screen_off(self, why):
+        log("screen off (%s)" % why)
+        self.screensaver("SetActive", GLib.Variant("(b)", (True,)))
+        if self.suspend_enabled() and not self.suspend_id:
+            self.suspend_id = GLib.timeout_add(SUSPEND_DELAY_MS, self.do_suspend)
+
+    def do_suspend(self):
+        self.suspend_id = 0
+        if not self.screen_is_off():
+            return GLib.SOURCE_REMOVE
+        log("suspend is enabled in sleep.conf.d: suspending")
+        self.clear_wake_intent()
+        self.suspending = True
+        self.logind("Suspend", GLib.Variant("(b)", (False,)))
+        return GLib.SOURCE_REMOVE
+
+    def screen_on(self, why, verify=True):
+        log("screen on (%s)" % why)
+        if self.suspend_id:
+            GLib.source_remove(self.suspend_id)
+            self.suspend_id = 0
+            log("pending suspend cancelled")
+        elif self.suspending and not self.resumed_just_now():
+            # Too late to cancel: ask the sleep hook for an immediate wake-up.
+            try:
+                open(WAKE_INTENT, "w").close()
+                log("suspend already under way: wake-up requested")
+            except OSError as e:
+                log("cannot write %s: %s" % (WAKE_INTENT, e))
+        self.screensaver("SetActive", GLib.Variant("(b)", (False,)))
+        if verify:
+            # Right after a resume the shell sometimes ignores the first request.
+            GLib.timeout_add(600, self.verify_on, why)
+            GLib.timeout_add(1500, self.verify_on, why)
+
+    def verify_on(self, why):
+        if self.screen_is_off() and not self.suspend_id and not self.suspending:
+            log("screen still off after 'screen on (%s)': retrying" % why)
+            self.screensaver("SetActive", GLib.Variant("(b)", (False,)))
+        return GLib.SOURCE_REMOVE
+
+    def power_dialog(self):
+        self.long_press_id = 0
+        self.long_press_fired = True
+        log("power button held: power-off dialog")
+        if self.screen_is_off():
+            self.screensaver("SetActive", GLib.Variant("(b)", (False,)))
+        self.call(self.session, "org.gnome.SessionManager", "/org/gnome/SessionManager",
+                  "org.gnome.SessionManager", "Shutdown")
+        return GLib.SOURCE_REMOVE
+
+    # -- input --------------------------------------------------------------
+    def open_devices(self):
+        found = set()
+        for path in sorted(glob.glob("/sys/class/input/event*/device/name")):
+            try:
+                with open(path) as f:
+                    role = DEVICES.get(f.read().strip())
+            except OSError:
+                continue
+            if not role or role in found:
+                continue
+            dev = "/dev/input/" + path.split("/")[4]
+            try:
+                fd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError as e:
+                log("cannot open %s (%s): %s" % (dev, role, e))
+                continue
+            found.add(role)
+            GLib.io_add_watch(fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR,
+                              self.on_input, role)
+            log("watching %s (%s)" % (dev, role))
+        if not found:
+            raise SystemExit("no power key / hall sensor input device found")
+
+    def on_input(self, fd, cond, role):
+        if cond & (GLib.IO_HUP | GLib.IO_ERR):
+            raise SystemExit("%s input device went away" % role)  # systemd restarts us
+        try:
+            data = os.read(fd, EVENT.size * 32)
+        except BlockingIOError:
+            return GLib.SOURCE_CONTINUE
+        for off in range(0, len(data) - EVENT.size + 1, EVENT.size):
+            _, _, etype, code, value = EVENT.unpack_from(data, off)
+            if role == "power" and etype == EV_KEY and code == KEY_POWER:
+                self.on_power(value)
+            elif role == "lid" and etype == EV_SW and code == SW_LID:
+                if value:
+                    if not self.screen_is_off():
+                        self.screen_off("cover closed")
+                else:
+                    self.screen_on("cover opened")
+        return GLib.SOURCE_CONTINUE
+
+    def on_power(self, value):
+        if value == 1:  # press
+            self.wake_press = self.resumed_just_now()
+            self.long_press_fired = False
+            if not self.long_press_id:
+                self.long_press_id = GLib.timeout_add(LONG_PRESS_MS, self.power_dialog)
+        elif value == 0:  # release
+            if self.long_press_id:
+                GLib.source_remove(self.long_press_id)
+                self.long_press_id = 0
+            if self.long_press_fired:
+                return
+            if self.wake_press:
+                self.wake_press = False
+                self.screen_on("power button (wake from suspend)")
+                return
+            if self.screen_is_off():
+                self.screen_on("power button")
+            else:
+                self.screen_off("power button")
+
+
+if __name__ == "__main__":
+    ScreenKeys()
+    GLib.MainLoop().run()

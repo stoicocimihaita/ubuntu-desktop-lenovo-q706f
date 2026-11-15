@@ -1,0 +1,266 @@
+#!/bin/bash
+# q706f-flash-kernel - write a packaged q706f boot image to boot_a, carefully.
+#
+# Runs ON the tablet, as root, by the owner. It writes a partition: never run it from
+# automation, and only after the image has been booted once from RAM (fastboot boot).
+#
+# Usage:
+#   q706f-flash-kernel [--dry-run] /boot/q706f/ubuntu-boot-<release>.img
+#   q706f-flash-kernel [--dry-run] /boot/q706f/boot_a-backup-<date>.img     (rollback)
+#   q706f-flash-kernel --list
+#
+# What it does, in order (any failed check aborts before anything is written):
+#   1. the image is a regular file under /boot/q706f named ubuntu-boot-*.img or
+#      boot_a-backup-*.img; its .sha256 file (if present) matches
+#   2. it is an Android boot image, header version 0, page size 4096, sizes consistent,
+#      smaller than boot_a (a backup may be exactly the partition size), cmdline carries
+#      q706f.rootimg= (not the diagnostic image); for ubuntu-boot images the kernel
+#      release inside has modules in /usr/lib/modules/<release>
+#   3. /proc/cmdline has exactly one androidboot.slot_suffix and it is _a
+#      (and /proc/device-tree/chosen/bootargs agrees when it exists): we run from slot a
+#   4. the target is /dev/disk/by-partlabel/boot_a, a block device, the ONLY partition
+#      named boot_a, not boot_b, not mounted; the current boot_a holds a q706f Ubuntu
+#      boot image (q706f.rootimg= on its cmdline) - never overwrite something unknown
+#   5. enough free space in /boot/q706f; current boot_a saved to
+#      /boot/q706f/boot_a-backup-<date>.img and the backup's sha256 re-checked against
+#      a second read of the partition
+#   6. the person types "boot_a" on the terminal (stdin must be a tty; refused when
+#      run non-interactively or from a dpkg maintainer script)
+#   7. dd conv=fsync, then the written range is read back (O_DIRECT) and its sha256
+#      compared with the image; the rollback command is printed
+# --dry-run performs steps 1-5 without writing anything (no backup either) and only
+# reports what step 6 would ask. Nothing here touches boot_b, dtbo_*, A/B flags or any
+# other partition; the active slot is not changed.
+#
+# Test hooks (for checking the logic on a PC, never against a real device): with
+# Q706F_FLASH_TEST=1 the paths below can be redirected to plain files; in that mode the
+# target must be a regular file (block/char devices and anything under /dev are refused)
+# and the root check is skipped. Without Q706F_FLASH_TEST=1 these variables are ignored.
+#   Q706F_TEST_CMDLINE  file used instead of /proc/cmdline
+#   Q706F_TEST_DT       file used instead of /proc/device-tree/chosen/bootargs
+#   Q706F_TEST_TARGET   regular file pretending to be boot_a
+#   Q706F_TEST_BOOTDIR  directory used instead of /boot/q706f
+#   Q706F_TEST_MODDIR   directory used instead of /usr/lib/modules
+set -euo pipefail
+umask 077
+export LC_ALL=C
+
+PROG=q706f-flash-kernel
+die()  { printf '%s: ERROR: %s\n' "$PROG" "$*" >&2; exit 1; }
+ok()   { printf '  ok   %s\n' "$*"; }
+note() { printf '  note %s\n' "$*"; }
+
+DRY=0; LIST=0; IMG=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY=1 ;;
+    --list) LIST=1 ;;
+    -h|--help) sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) die "unknown option $1" ;;
+    *) [ -z "$IMG" ] || die "only one image"; IMG="$1" ;;
+  esac
+  shift
+done
+
+# ---------------------------------------------------------------- environment
+TEST=0
+CMDLINE_FILE=/proc/cmdline
+DT_FILE=/proc/device-tree/chosen/bootargs
+BOOTDIR=/boot/q706f
+MODDIR=/usr/lib/modules
+TARGET=/dev/disk/by-partlabel/boot_a
+if [ "${Q706F_FLASH_TEST:-}" = 1 ]; then
+  TEST=1
+  CMDLINE_FILE="${Q706F_TEST_CMDLINE:?}"
+  DT_FILE="${Q706F_TEST_DT:-/nonexistent}"
+  TARGET="${Q706F_TEST_TARGET:?}"
+  BOOTDIR="${Q706F_TEST_BOOTDIR:?}"
+  MODDIR="${Q706F_TEST_MODDIR:?}"
+  case "$(readlink -f "$TARGET")" in /dev/*|/proc/*|/sys/*) die "test mode: target must not be under /dev, /proc or /sys" ;; esac
+  [ -f "$TARGET" ] && [ ! -L "$TARGET" ] || die "test mode: target must be an existing regular file"
+  echo "== TEST MODE: target is the plain file $TARGET"
+fi
+
+if [ "$LIST" = 1 ]; then
+  ls -l "$BOOTDIR"/ubuntu-boot-*.img "$BOOTDIR"/boot_a-backup-*.img 2>/dev/null || echo "no images in $BOOTDIR"
+  exit 0
+fi
+[ -n "$IMG" ] || die "usage: $PROG [--dry-run] $BOOTDIR/ubuntu-boot-<release>.img   (--list, --help)"
+[ "$TEST" = 1 ] || [ "$(id -u)" = 0 ] || die "must run as root (sudo)"
+[ -z "${DPKG_MAINTSCRIPT_PACKAGE:-}" ] || die "refusing to run from a dpkg maintainer script"
+# Checked again right before the question; failing early avoids a useless backup.
+[ "$DRY" = 1 ] || [ -t 0 ] || die "stdin is not a terminal: the confirmation must be typed by a person"
+
+# One run at a time.
+{ exec 9>"$BOOTDIR/.flash.lock"; } 2>/dev/null || die "cannot create $BOOTDIR/.flash.lock"
+flock -n 9 || die "another $PROG is running"
+
+u32() { od -An -t u4 -j "$2" -N 4 "$1" | tr -d ' '; }
+pad() { echo $(( ( $1 + PAGE - 1 ) / PAGE * PAGE )); }
+hdr_cmdline() { head -c 576 "$1" | tail -c 512 | tr -d '\0'; }
+
+# ---------------------------------------------------------------- 1. image file
+echo "== image"
+IMG="$(readlink -f "$IMG")"
+[ -f "$IMG" ] || die "$IMG is not a regular file"
+[ "$(dirname "$IMG")" = "$(readlink -f "$BOOTDIR")" ] || die "image must be in $BOOTDIR (got $IMG)"
+NAME="$(basename "$IMG")"
+case "$NAME" in
+  ubuntu-boot-*.img) KIND=kernel ;;
+  boot_a-backup-*.img) KIND=backup ;;
+  *) die "image name must be ubuntu-boot-*.img or boot_a-backup-*.img" ;;
+esac
+IMG_SIZE="$(stat -c %s "$IMG")"
+IMG_SHA="$(sha256sum "$IMG" | cut -d' ' -f1)"
+if [ -f "$IMG.sha256" ]; then
+  [ "$(cut -d' ' -f1 "$IMG.sha256")" = "$IMG_SHA" ] || die "sha256 does not match $IMG.sha256"
+  ok "sha256 matches $NAME.sha256"
+else
+  note "no $NAME.sha256 to compare with"
+fi
+
+# ---------------------------------------------------------------- 2. boot image header
+[ "$(head -c 8 "$IMG")" = "ANDROID!" ] || die "not an Android boot image (no ANDROID! magic)"
+HV="$(u32 "$IMG" 40)"; PAGE="$(u32 "$IMG" 36)"
+KSZ="$(u32 "$IMG" 8)"; RSZ="$(u32 "$IMG" 16)"; SSZ="$(u32 "$IMG" 24)"
+[ "$HV" = 0 ] || die "boot image header version $HV, expected 0 (the Lenovo ABL needs v0 + appended DTB)"
+[ "$PAGE" = 4096 ] || die "page size $PAGE, expected 4096"
+[ "$KSZ" -gt 1048576 ] && [ "$RSZ" -gt 0 ] || die "implausible kernel/ramdisk sizes ($KSZ/$RSZ)"
+NEED=$(( PAGE + $(pad "$KSZ") + $(pad "$RSZ") + $(pad "$SSZ") ))
+[ "$IMG_SIZE" -ge "$NEED" ] || die "file ($IMG_SIZE bytes) shorter than its header says ($NEED)"
+[ $(( IMG_SIZE % 4096 )) = 0 ] || die "size $IMG_SIZE is not a multiple of 4096"
+CMD="$(hdr_cmdline "$IMG")"
+[[ "$CMD" == *q706f.rootimg=* ]] || die "cmdline has no q706f.rootimg= (diagnostic or foreign image): $CMD"
+ok "header v0, page 4096, kernel $KSZ, ramdisk $RSZ bytes, image $IMG_SIZE bytes"
+ok "cmdline: $CMD"
+REL=""
+REL="$( { tail -c +$((PAGE + 1)) "$IMG" | head -c "$KSZ" | gzip -dc 2>/dev/null || true; } \
+        | grep -a -m1 -o 'Linux version [^ ]*' | cut -d' ' -f3 || true)"
+if [ "$KIND" = kernel ]; then
+  [ -n "$REL" ] || die "cannot read the kernel release from the image"
+  [ "$NAME" = "ubuntu-boot-$REL.img" ] || die "image says release $REL but is named $NAME"
+  [ -s "$MODDIR/$REL/modules.dep" ] || die "no modules for $REL in $MODDIR (install the linux-q706f-$REL package first)"
+  ok "kernel release $REL, modules present in $MODDIR/$REL"
+else
+  note "rollback image, kernel release ${REL:-unknown}"
+  [ -z "$REL" ] || [ -s "$MODDIR/$REL/modules.dep" ] || note "no modules for $REL in $MODDIR - it will boot without loadable modules"
+fi
+
+# ---------------------------------------------------------------- 3. running slot
+echo "== running slot"
+read -r CMDLINE < "$CMDLINE_FILE" || true
+mapfile -t SUFFIXES < <(tr ' ' '\n' <<<"$CMDLINE" | sed -n 's/^androidboot\.slot_suffix=//p')
+[ "${#SUFFIXES[@]}" = 1 ] || die "expected one androidboot.slot_suffix on the kernel cmdline, found ${#SUFFIXES[@]}"
+[ "${SUFFIXES[0]}" = _a ] || die "running from slot '${SUFFIXES[0]}', not _a: refusing to touch boot_a"
+ok "kernel cmdline: androidboot.slot_suffix=_a"
+if [ -r "$DT_FILE" ]; then
+  dts="$(tr '\0 ' '\n\n' < "$DT_FILE" | sed -n 's/^androidboot\.slot_suffix=//p' | sort -u)"
+  [ -z "$dts" ] || [ "$dts" = _a ] || die "device tree bootargs say slot '$dts'"
+  ok "device tree bootargs agree (${dts:-no slot entry})"
+fi
+[[ "$CMDLINE" == *q706f.rootimg=* ]] || die "the running system was not booted with q706f.rootimg= (not the Ubuntu boot image?)"
+ok "running system booted with q706f.rootimg="
+
+# ---------------------------------------------------------------- 4. target partition
+echo "== target"
+if [ "$TEST" = 1 ]; then
+  DEV="$TARGET"; PART_SIZE="$(stat -c %s "$DEV")"
+  note "test mode: partition checks (sysfs, by-partlabel, mounts) skipped"
+else
+  [ -e "$TARGET" ] || die "$TARGET does not exist"
+  DEV="$(readlink -f "$TARGET")"
+  [ -b "$DEV" ] || die "$DEV is not a block device"
+  SYS="/sys/class/block/$(basename "$DEV")"
+  grep -qx 'PARTNAME=boot_a' "$SYS/uevent" || die "$DEV is not named boot_a in sysfs"
+  n="$(grep -lx 'PARTNAME=boot_a' /sys/class/block/*/uevent 2>/dev/null | wc -l)"
+  [ "$n" = 1 ] || die "$n partitions are named boot_a, expected exactly 1"
+  if [ -e /dev/disk/by-partlabel/boot_b ]; then
+    [ "$(readlink -f /dev/disk/by-partlabel/boot_b)" != "$DEV" ] || die "boot_a and boot_b resolve to the same device"
+  fi
+  ! grep -q "^$DEV " /proc/mounts || die "$DEV is mounted"
+  PART_SIZE=$(( $(cat "$SYS/size") * 512 ))
+fi
+[ "$PART_SIZE" -gt 0 ] || die "cannot determine the size of boot_a"
+if [ "$KIND" = kernel ]; then
+  [ "$IMG_SIZE" -lt "$PART_SIZE" ] || die "image ($IMG_SIZE) does not fit in boot_a ($PART_SIZE)"
+else
+  [ "$IMG_SIZE" -le "$PART_SIZE" ] || die "backup ($IMG_SIZE) larger than boot_a ($PART_SIZE)"
+fi
+ok "boot_a = $DEV, $PART_SIZE bytes, image uses $(( IMG_SIZE * 100 / PART_SIZE ))%"
+[ "$(head -c 8 "$DEV")" = "ANDROID!" ] || die "current boot_a holds no Android boot image: refusing to overwrite it (use fastboot from the PC)"
+CUR_CMD="$(hdr_cmdline "$DEV")"
+[[ "$CUR_CMD" == *q706f.rootimg=* ]] || die "current boot_a is not a q706f Ubuntu image (cmdline: $CUR_CMD); use fastboot from the PC"
+ok "current boot_a holds a q706f Ubuntu boot image"
+CUR_SHA="$(head -c "$IMG_SIZE" "$DEV" | sha256sum | cut -d' ' -f1)"
+if [ "$CUR_SHA" = "$IMG_SHA" ]; then
+  echo "== boot_a already contains exactly this image; nothing to do."
+  exit 0
+fi
+
+# ---------------------------------------------------------------- 5. backup
+echo "== backup"
+BACKUP="$BOOTDIR/boot_a-backup-$(date +%Y%m%d-%H%M%S).img"
+[ ! -e "$BACKUP" ] || die "$BACKUP already exists"
+FREE=$(( $(df -P -B1 "$BOOTDIR" | awk 'NR==2 {print $4}') ))
+[ "$FREE" -gt $(( PART_SIZE + 64 * 1048576 )) ] || die "not enough space in $BOOTDIR for a backup ($FREE bytes free)"
+ok "$FREE bytes free in $BOOTDIR"
+if [ "$DRY" = 1 ]; then
+  note "dry run: would save boot_a to $BACKUP and verify it"
+else
+  dd if="$DEV" of="$BACKUP" bs=4M conv=fsync status=none
+  [ "$(stat -c %s "$BACKUP")" = "$PART_SIZE" ] || die "backup has the wrong size"
+  B_SHA="$(sha256sum "$BACKUP" | cut -d' ' -f1)"
+  P_SHA="$(sha256sum "$DEV" | cut -d' ' -f1)"
+  [ "$B_SHA" = "$P_SHA" ] || die "backup sha256 differs from a second read of boot_a"
+  echo "$B_SHA  $(basename "$BACKUP")" > "$BACKUP.sha256"
+  chmod 0600 "$BACKUP" "$BACKUP.sha256"
+  ok "saved $BACKUP (sha256 ${B_SHA:0:16}…, verified)"
+fi
+
+# ---------------------------------------------------------------- 6. confirmation
+echo "== confirmation"
+cat <<EOF
+  WRITE   $NAME  (sha256 ${IMG_SHA:0:16}…, $IMG_SIZE bytes${REL:+, kernel $REL})
+  TO      boot_a = $DEV   (slot a, the running slot; boot_b is not touched)
+  RISK    if this kernel does not boot, the bootloader falls back to slot b
+          (Ubuntu Touch); recovery then needs the PC (fastboot set_active a, flash)
+EOF
+if [ "$DRY" = 1 ]; then
+  if [ -t 0 ]; then note "dry run: would now ask you to type boot_a"
+  else note "dry run: stdin is not a terminal - a real run would refuse here"; fi
+  echo "== dry run finished: all checks passed, nothing was written."
+  exit 0
+fi
+[ -t 0 ] || die "stdin is not a terminal: the confirmation must be typed by a person"
+printf "Type boot_a to write it (anything else aborts): "
+IFS= read -r ANSWER || die "no answer"
+[ "$ANSWER" = boot_a ] || die "not confirmed; nothing was written (backup kept: $BACKUP)"
+
+# ---------------------------------------------------------------- 7. write + verify
+echo "== writing"
+dd if="$IMG" of="$DEV" bs=4M conv=fsync,notrunc status=none
+sync
+if [ "$TEST" = 1 ]; then
+  RB_SHA="$(head -c "$IMG_SIZE" "$DEV" | sha256sum | cut -d' ' -f1)"
+else
+  blockdev --flushbufs "$DEV" 2>/dev/null || true
+  RB_SHA="$(dd if="$DEV" bs=4096 count=$(( IMG_SIZE / 4096 )) iflag=direct status=none | sha256sum | cut -d' ' -f1)"
+fi
+if [ "$RB_SHA" != "$IMG_SHA" ]; then
+  cat >&2 <<EOF
+$PROG: ERROR: read-back sha256 of boot_a does NOT match the image.
+Do NOT reboot. Write the backup back now:
+  sudo $PROG $BACKUP
+or copy $BACKUP to the PC and, in fastboot: fastboot flash boot_a <that file>
+EOF
+  exit 1
+fi
+ok "read back $IMG_SIZE bytes from boot_a: sha256 matches"
+cat <<EOF
+== done: boot_a now holds $NAME. It is used at the next boot.
+   Rollback from this system:   sudo $PROG $BACKUP
+   Rollback from the PC:        copy $BACKUP to the PC, then in fastboot:
+                                fastboot flash boot_a $(basename "$BACKUP")
+   If the tablet ends up in Ubuntu Touch (slot b) after a failed boot:
+                                fastboot set_active a   (then flash the backup)
+EOF

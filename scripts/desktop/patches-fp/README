@@ -1,0 +1,110 @@
+q706f fingerprint kernel series (stage 0) on top of the project kernel v7.3.4
+============================================================================
+
+NOT part of the normal build. scripts/desktop/build-kernel.sh only reads
+scripts/desktop/patches/*.patch; nothing in this directory is applied there.
+This series is for the RAM-boot test kernel 7.3.4-fp only (see build-fp.sh and
+out/desktop/kernel-fp/TEST.md). Moving any of it into scripts/desktop/patches/
+needs the owner's approval after stage 1 (docs/EVALUARE-AMPRENTA-2026-11-13.md, s.13).
+
+Base
+----
+sources/linux-desktop = Linux v7.3.4 + scripts/desktop/patches/*.patch
+(build-kernel.sh stamp "7.3.4 56b82f75c7e1fb28"). The patches below apply in
+file-name order with `patch -p1 -F0` on a copy of that tree (verified: the result
+is identical to the rebased git tree in sources/linux-fp).
+
+Origin and licences
+-------------------
+0001-0045  wrobelda/linux, branch qcom-qseecom-tee (based on v7.1), 45 commits,
+           as exported in out/desktop/fp-eval/patches/qcom-qseecom-tee.patch
+           (includes the 2026-11-02 fixes: single-file images, < 4 GiB TZ memory
+           for pre-4.0 QSEE). Adds QSEECom app load/unload/listeners to qcom_scm,
+           single-blob assembly to mdt_loader, and drivers/tee/qseecom (qseecomtee.ko,
+           TEE_IMPL_ID_QSEECOM = 5). Licence: GPL-2.0-only (code), GPL-2.0 (docs,
+           Kconfig/Makefile). GPL-2.0 compatible.
+0101-0103  wrobelda/linux, branch goodix-fp-spi (based on v7.1), commits 1-3 of 4:
+           binding (GPL-2.0-only OR BSD-2-Clause), driver goodix_fp_spi.c
+           (GPL-2.0-only; derived from the downstream Goodix/Xiaomi gf_spi driver,
+           copyrights kept), documentation (GPL-2.0).
+           Commit 4/4 (Xiaomi elish DTS node) is omitted: it is for the reference
+           tablet and does not apply to (or concern) q706f.
+0201       q706f (new): sensor node + GPIO 26 freed from audio4_1p8_supply.
+
+Each patch carries a "q706f-notes:" block after the "---" line with the upstream
+commit id, the licence of the touched files and what the rebase needed.
+
+Rebase onto 7.3.4
+-----------------
+- 44 of 45 qseecom commits and 2 of 3 goodix commits: clean (git am, no fuzz).
+- 0030 (mdt_loader): Kconfig hunk re-anchored; 7.3 moved QCOM_MDT_LOADER next to
+  QCOM_KRYO_L2_ACCESSORS. Code hunks applied with a 1-line offset.
+- 0102 (goodix driver): drivers/input/misc/Kconfig hunk re-anchored (new entry
+  lands after INPUT_QCOM_SPMI_HAPTICS instead of after INPUT_PMIC8XXX_PWRKEY).
+- The generic PAS layer of 7.3 (qcom_pas.c, qcom_pas_tee.c; mdt_loader now calls
+  qcom_pas_*) does NOT conflict: the series adds new qcom_scm_qseecom_* entry
+  points and two new mdt_loader helpers (qcom_mdt_get_image_size/read_image) and
+  does not touch the PAS paths.
+- No code was changed. Our "profile 2" work (out/desktop/fp-eval/patches/) is
+  userspace only (libfprint goodixqsee driver, gfharness); the kernel side is
+  protocol-agnostic and needs no profile change.
+
+Provenance caveats (read before publishing)
+-------------------------------------------
+- Not posted upstream; the author says it needs a thorough review before an RFC.
+- Only 1 of the 45 qseecom commits carries a Signed-off-by; most carry
+  "Assisted-by:" trailers for LLM tools. Fine for a private test kernel; for a
+  public tree, keep the authorship as is and do not add sign-offs on the author's
+  behalf.
+
+The DT patch (0201) -- changes the speaker supply wiring
+--------------------------------------------------------
+- fingerprint node, compatible "goodix,gf3626" (the only one the driver matches),
+  IRQ TLMM 23 rising, reset TLMM 26 active low, vdd = fixed regulator fp_vdd on
+  TLMM 131 fed from vreg_l7c_ts_3p0, firmware-name "goodixfp".
+- SPI (QUP SE14, TLMM 40-43) is not described: it belongs to TrustZone
+  (gpio-reserved-ranges = <40 4> stays).
+- audio4_1p8_supply loses gpio 26, enable-active-high and the spkr_1_sd_n_active
+  pin state; it stays a GPIO-less always-on fixed regulator for the cs35l45
+  vdd-batt-supply references. The stock DT uses TLMM 26 only for the fingerprint
+  reset; the amplifiers use TLMM 49/127.
+- REQUIRES THE OWNER'S LEFT/RIGHT SPEAKER TEST on the RAM-booted 7.3.4-fp kernel
+  before it goes anywhere else.
+
+Config
+------
+q706f-fp.config, merged after the three normal fragments:
+CONFIG_QCOM_QSEECOM=y, CONFIG_TEE_QSEECOM=m, CONFIG_INPUT_GOODIX_FP_SPI=m,
+CONFIG_QCOM_TZMEM_MODE_GENERIC=y (SHMBRIDGE is the fallback if QSEE refuses the
+buffers at TA load), QCOMTEE/RPMB/UEFISECAPP off, CMA 64 MiB (already set in
+q706f-7.3.4-extra.config). build-fp.sh checks every line survived olddefconfig.
+
+Build
+-----
+scripts/desktop/patches-fp/build-fp.sh [prepare|kernel|ctn730|image|all]
+  -> out/desktop/kernel-fp/ (release 7.3.4-fp, modules side by side),
+     out/desktop/ubuntu-boot-fp.img (header v0, DTB appended, cmdline of
+     ubuntu-boot.img + modprobe.blacklist=goodix_fp_spi,qseecomtee; the two
+     modules are also left out of the initramfs so they never bind on their own).
+
+Never in this directory or any repo: the Lenovo TA (goodixfp.mdt/.b00-.b07), the
+stock HAL libraries, their disassembly, or /var/lib/qsee-supplicant contents.
+They stay under out/desktop/stock-fw/ (git-ignored).
+
+Userspace (NOT built here; needs a separate approval)
+-----------------------------------------------------
+- qsee-supplicant: github.com/wrobelda/qsee-supplicant, main @ 36e06680cf7f
+  (2026-08-10, debian/changelog 0.1.1-1). BSD-2-Clause (+ BSD-3-Clause-Clear
+  qsee_protocol.h, BSD-2-Clause handle_db). Build deps: libc, pthread; .deb via
+  dpkg-buildpackage. Provides qsee-supplicant + qsee-app-loader + systemd units.
+- libfprint: github.com/wrobelda/libfprint, branch goodix-qsee @ 430e24e538ba
+  (2026-08-10, version 1.94.100). LGPL-2.1-or-later. Needs our profile 2
+  (out/desktop/fp-eval/patches/goodix-qsee-profile.h, goodix-qsee-proto2.c,
+  README-profile2.md) wired into goodix-qsee.c. Build deps: meson >= 0.62,
+  glib >= 2.68, gusb, gudev (pixman/openssl/cairo/gobject-introspection optional).
+  Build only -Ddrivers=goodixqsee, install under /opt/q706f-fp.
+- goodix-fp-spi-linux: github.com/wrobelda/goodix-fp-spi-linux, master @
+  4663eb9019f5 (2026-11-02). GPL-2.0-only. gfharness (+ profile2-gfharness.patch),
+  udev rule for qsee-app-loader@<firmware_name>.service.
+- fprintd / libpam-fprintd 1.94.5 from the Ubuntu archive (--no-install-recommends);
+  ABI check needed against the archive libfprint-2-2 1.95.1+tod1.

@@ -1,0 +1,24 @@
+#!/bin/sh
+# Connect from the tablet to the owner's PC desktop over RDP (GNOME Remote Desktop).
+# Host, port and (optionally) the server certificate fingerprint come from
+# ~/.config/q706f-remote-pc.conf (HOST=name.local PORT=3390 FINGERPRINT=aa:bb:...,
+# as printed by `grdctl status` on the PC);
+# the user name and password are read from the keyring, never from a file:
+#   secret-tool store --label='PC remote desktop user' service q706f-pc-rdp field user
+#   secret-tool store --label='PC remote desktop password' service q706f-pc-rdp field password
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/q706f-remote-pc.conf"
+HOST=; PORT=3390; FINGERPRINT=
+[ -r "$CONF" ] && . "$CONF"
+U=$(secret-tool lookup service q706f-pc-rdp field user)
+P=$(secret-tool lookup service q706f-pc-rdp field password)
+if [ -z "$HOST" ] || [ -z "$U" ] || [ -z "$P" ]; then
+  zenity --error --text="Remote PC: host or credentials are not configured." 2>/dev/null \
+    || echo "host or credentials not configured" >&2
+  exit 1
+fi
+# Not fullscreen on purpose: the top bar (with the on-screen keyboard button) stays
+# reachable; the osk-button@q706f shell extension maximises this window.
+# Arguments go through stdin so the password never shows up in the process list.
+CERT=/cert:tofu; [ -n "$FINGERPRINT" ] && CERT="/cert:fingerprint:sha256:$FINGERPRINT"
+printf '%s\n' "/v:$HOST:$PORT" "/u:$U" "/p:$P" "$CERT" /smart-sizing \
+  /gfx /network:auto +clipboard /sound "$@" | exec sdl-freerdp3 /args-from:stdin

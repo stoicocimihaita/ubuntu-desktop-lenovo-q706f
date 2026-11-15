@@ -1,0 +1,424 @@
+#!/usr/bin/python3
+"""q706f-pen-rebond: re-pair the Lenovo Precision Pen 3 when it lost its bond.
+
+Failure seen on 2026-11-13 and 2026-11-14 (after a long s2idle with the pen
+docked): the pen forgets its LTK for the tablet while BlueZ still has it.
+The pen then reconnects about every 0.9 s, every link fails with
+"Encryption Change: PIN or Key Missing", the tablet drops it and bluetoothd
+logs, per attempt, three lines such as
+
+  profiles/deviceinfo/deviceinfo.c:read_pnpid_cb() Error reading PNP_ID
+      value: Request attribute has encountered an unlikely error
+  profiles/input/hog-lib.c:info_read_cb() HID Information read failed:
+      Request attribute has encountered an unlikely error
+
+The manual fix always worked: back up the bond, remove the device, scan,
+pair (Just Works), trust, connect.  This daemon does the same, guarded:
+
+  * detection: follows the bluetooth.service journal; >= THRESHOLD of those
+    lines within WINDOW_S seconds, then the pen (found by name, paired) must
+    be "not usable" (not Connected+ServicesResolved) in most of the samples
+    taken over a few seconds.  The log lines carry no address, so the BlueZ
+    state check is what ties the burst to the pen.
+  * at most one automatic re-pair per COOLDOWN_S (kept across restarts in
+    /var/lib/q706f/pen-rebond.last);
+  * the bond directory is archived first under /var/lib/q706f/pen-bond-backups
+    (root only, the last KEEP_BACKUPS kept);
+  * if pairing fails twice in a row the daemon gives up until it is
+    restarted and logs how to pair by hand;
+  * every action is logged with its reason; addresses are masked.
+
+It never talks to the CTN730 (no pen_cmd, no enable) and changes nothing
+else.  Disable: systemctl disable --now q706f-pen-rebond.service
+
+Options:
+  --dry-run            detect and log, but never remove/pair
+  --replay FILE        read journal lines (journalctl -o short-unix) from FILE
+                       instead of following the live journal (implies
+                       --dry-run)
+  --assume-pen STATE   with --replay: skip BlueZ, pretend the pen is
+                       "broken" (paired, never usable) or "healthy"
+"""
+import argparse
+import collections
+import json
+import os
+import re
+import select
+import subprocess
+import sys
+import tarfile
+import time
+
+PEN_NAME = "Lenovo Precision Pen 3"
+BLUEZ = "org.bluez"
+THRESHOLD = 10          # matching lines ...
+WINDOW_S = 30           # ... within this many seconds
+RECHECK_S = 60          # after a healthy verdict, ignore bursts this long
+COOLDOWN_S = 600        # at most one automatic re-pair per 10 minutes
+MAX_PAIR_FAILS = 2
+KEEP_BACKUPS = 3
+STATE_DIR = "/var/lib/q706f"
+BACKUP_DIR = os.path.join(STATE_DIR, "pen-bond-backups")
+LAST_FILE = os.path.join(STATE_DIR, "pen-rebond.last")
+BT_LIB = "/var/lib/bluetooth"
+
+PATTERN = re.compile(
+    r"(hog-lib\.c:\S+ .*unlikely error"
+    r"|deviceinfo\.c:read_pnpid_cb\(\) Error reading PNP_ID)")
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x01|\x02|\r")
+MAC_RE = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$")
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def mask(mac):
+    return "**:**:**:**:**:" + mac[-2:] if mac else "-"
+
+
+# --------------------------------------------------------------- BlueZ ---
+
+def busctl(*args, timeout=20):
+    try:
+        res = subprocess.run(("busctl", "--system", "--json=short") + args,
+                             capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return False, None
+    if res.returncode != 0:
+        return False, None
+    try:
+        return True, json.loads(res.stdout) if res.stdout.strip() else None
+    except ValueError:
+        return True, None
+
+
+def bluez_objects():
+    ok, reply = busctl("call", BLUEZ, "/", "org.freedesktop.DBus.ObjectManager",
+                       "GetManagedObjects")
+    if not ok or not reply:
+        return {}
+    out = {}
+    for path, ifaces in reply["data"][0].items():
+        out[path] = {iface: {k: v.get("data") for k, v in props.items()}
+                     for iface, props in ifaces.items()}
+    return out
+
+
+def find_pen(objects, address=None):
+    """(path, Device1 props, adapter address) of the pen, or (None, {}, None).
+    By address if given, else the paired device whose name is PEN_NAME."""
+    for path, ifaces in objects.items():
+        dev = ifaces.get("org.bluez.Device1")
+        if not dev:
+            continue
+        if address:
+            if (dev.get("Address") or "").upper() != address:
+                continue
+        elif not (dev.get("Paired")
+                  and PEN_NAME in (dev.get("Name") or dev.get("Alias") or "")):
+            continue
+        adapter = objects.get(dev.get("Adapter") or "", {}) \
+                         .get("org.bluez.Adapter1", {}).get("Address")
+        return path, dev, (adapter or "").upper() or None
+    return None, {}, None
+
+
+def pen_usable(dev):
+    return bool(dev.get("Connected") and dev.get("ServicesResolved"))
+
+
+# ------------------------------------------------------------ backups ---
+
+def backup_bond(adapter, address):
+    """Archive /var/lib/bluetooth/<adapter>/<pen> (+ cache entry)."""
+    src = os.path.join(BT_LIB, adapter, address)
+    cache = os.path.join(BT_LIB, adapter, "cache", address)
+    if not os.path.isdir(src):
+        log("backup: no bond directory for the pen, nothing archived")
+        return None
+    os.makedirs(BACKUP_DIR, mode=0o700, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+    os.chmod(BACKUP_DIR, 0o700)
+    name = time.strftime("%Y%m%d-%H%M%S") + ".tar"
+    dest = os.path.join(BACKUP_DIR, name)
+    old_umask = os.umask(0o077)
+    try:
+        with tarfile.open(dest, "w") as tar:
+            tar.add(src, arcname=os.path.join(adapter, address))
+            if os.path.exists(cache):
+                tar.add(cache, arcname=os.path.join(adapter, "cache", address))
+    finally:
+        os.umask(old_umask)
+    archives = sorted(f for f in os.listdir(BACKUP_DIR) if f.endswith(".tar"))
+    for old in archives[:-KEEP_BACKUPS]:
+        os.unlink(os.path.join(BACKUP_DIR, old))
+    log(f"backup: bond archived as {dest} "
+        f"(keeping the last {KEEP_BACKUPS})")
+    return dest
+
+
+def read_last():
+    try:
+        with open(LAST_FILE) as f:
+            return float(f.read().strip())
+    except (OSError, ValueError):
+        return 0.0
+
+
+def write_last(when):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    with open(LAST_FILE, "w") as f:
+        f.write(f"{when:.0f}\n")
+
+
+# ------------------------------------------------------- bluetoothctl ---
+
+class Btctl:
+    """bluetoothctl driven over pipes (5.85 accepts commands on stdin and
+    registers its own agent, as in the manual fix)."""
+
+    def __init__(self):
+        self.proc = subprocess.Popen(
+            ("bluetoothctl",), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, bufsize=0)
+        self.buf = ""
+
+    def send(self, cmd):
+        self.proc.stdin.write((cmd + "\n").encode())
+        self.proc.stdin.flush()
+
+    def expect(self, patterns, timeout):
+        """Wait for one of the regexes; answer agent yes/no prompts.
+        Returns the index of the match or None on timeout/EOF."""
+        regexes = [re.compile(p) for p in patterns]
+        deadline = time.monotonic() + timeout
+        while True:
+            for i, rx in enumerate(regexes):
+                m = rx.search(self.buf)
+                if m:
+                    self.buf = self.buf[m.end():]
+                    return i
+            if re.search(r"\(yes/no\)", self.buf):
+                log("bluetoothctl: agent asked for confirmation, answered yes")
+                self.buf = re.sub(r".*\(yes/no\)", "", self.buf, count=1,
+                                  flags=re.S)
+                self.send("yes")
+                continue
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            r, _, _ = select.select([self.proc.stdout], [], [], min(left, 1))
+            if r:
+                data = self.proc.stdout.read1(4096) if hasattr(
+                    self.proc.stdout, "read1") else os.read(
+                    self.proc.stdout.fileno(), 4096)
+                if not data:
+                    return None
+                self.buf = (self.buf + ANSI.sub("", data.decode(
+                    errors="replace")))[-20000:]
+
+    def close(self):
+        try:
+            self.send("quit")
+            self.proc.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired, BrokenPipeError):
+            self.proc.kill()
+
+
+def repair(address, adapter):
+    """remove -> (scan, pair, trust, connect) up to MAX_PAIR_FAILS times.
+    Returns True when the pen is paired and connected again."""
+    bt = Btctl()
+    try:
+        if bt.expect([r"Agent registered"], 15) is None:
+            log("repair: bluetoothctl did not start (no agent), aborted "
+                "before removing anything")
+            return False
+        bt.send(f"remove {address}")
+        res = bt.expect([r"Device has been removed", r"Failed to remove",
+                         r"not available"], 20)
+        log("repair: remove " + mask(address) + ": "
+            + {0: "ok", 1: "failed", 2: "device unknown", None: "timeout"}[res])
+        if res == 1 or res is None:
+            return False
+        fails = 0
+        while fails < MAX_PAIR_FAILS:
+            bt.send("scan le")
+            found = bt.expect([rf"NEW\] Device {address}"], 20)
+            bt.send("scan off")
+            if found is None:
+                fails += 1
+                log(f"repair: pen {mask(address)} not seen while scanning "
+                    f"(attempt {fails}/{MAX_PAIR_FAILS})")
+                continue
+            time.sleep(1)
+            bt.send(f"pair {address}")
+            res = bt.expect([r"Pairing successful", r"Failed to pair",
+                             r"not available"], 40)
+            if res != 0:
+                fails += 1
+                log(f"repair: pairing {mask(address)} failed "
+                    f"(attempt {fails}/{MAX_PAIR_FAILS})")
+                time.sleep(3)
+                continue
+            log(f"repair: paired {mask(address)}")
+            bt.send(f"trust {address}")
+            bt.expect([r"trust succeeded", r"Failed to set trusted"], 10)
+            bt.send(f"connect {address}")
+            res = bt.expect([r"Connection successful", r"Failed to connect"],
+                            30)
+            log("repair: connect: " + ("ok" if res == 0 else "not confirmed"))
+            break
+        else:
+            return False
+    finally:
+        bt.close()
+    time.sleep(5)
+    _, dev, _ = find_pen(bluez_objects(), address)
+    ok = bool(dev.get("Paired") and dev.get("Connected"))
+    log(f"repair: final state paired={bool(dev.get('Paired'))} "
+        f"connected={bool(dev.get('Connected'))} "
+        f"trusted={bool(dev.get('Trusted'))}")
+    return ok
+
+
+# ---------------------------------------------------------- detection ---
+
+class Detector:
+    def __init__(self, args):
+        self.args = args
+        self.hits = collections.deque()
+        self.quiet_until = 0.0
+        self.given_up = False
+        self.last_dry = 0.0       # dry run / replay: cooldown kept in memory
+
+    def feed(self, line):
+        """Return True when a burst was just detected."""
+        if not PATTERN.search(line):
+            return False
+        try:
+            ts = float(line.split(None, 1)[0])
+        except (ValueError, IndexError):
+            ts = time.time()
+        self.hits.append(ts)
+        while self.hits and ts - self.hits[0] > WINDOW_S:
+            self.hits.popleft()
+        if len(self.hits) < THRESHOLD or ts < self.quiet_until:
+            return False
+        self.quiet_until = ts + RECHECK_S
+        log(f"detect: {len(self.hits)} HoG/PNP_ID 'unlikely error' lines "
+            f"within {WINDOW_S} s")
+        self.hits.clear()
+        return True
+
+    def pen_state(self):
+        """(address, adapter, broken?) from a few BlueZ samples."""
+        if self.args.assume_pen:
+            broken = self.args.assume_pen == "broken"
+            return "00:00:00:00:00:AA", "00:00:00:00:00:BB", broken
+        samples, unusable, address, adapter = 10, 0, None, None
+        for _ in range(samples):
+            path, dev, adp = find_pen(bluez_objects(), address)
+            if not path:
+                return None, None, False
+            address = address or (dev.get("Address") or "").upper()
+            adapter = adapter or adp
+            if not dev.get("Paired"):
+                return None, None, False
+            if not pen_usable(dev):
+                unusable += 1
+            time.sleep(0.5)
+        log(f"check: pen {mask(address)} unusable in {unusable}/{samples} "
+            "samples")
+        return address, adapter, unusable >= 8
+
+    def handle_burst(self, now):
+        if self.given_up:
+            log("action: none, automatic re-pair gave up earlier "
+                "(restart the service to re-arm)")
+            return
+        address, adapter, broken = self.pen_state()
+        if not address:
+            log("action: none, no paired pen named "
+                f"'{PEN_NAME}' (errors are from another device?)")
+            return
+        if not broken:
+            log("action: none, the pen is connected and usable")
+            return
+        if not (MAC_RE.match(address) and adapter and MAC_RE.match(adapter)):
+            log("action: none, could not read the pen/adapter address")
+            return
+        last = self.last_dry if self.args.dry_run else read_last()
+        if now - last < COOLDOWN_S:
+            log(f"action: none, last automatic re-pair {int(now - last)} s "
+                f"ago (limit one per {COOLDOWN_S} s)")
+            return
+        reason = ("reason: the pen keeps reconnecting and fails encryption "
+                  "(bond key lost on the pen side)")
+        if self.args.dry_run:
+            self.last_dry = now
+            log(f"action (dry run): would back up the bond of "
+                f"{mask(address)} and remove/scan/pair/trust/connect; "
+                + reason)
+            return
+        log(f"action: re-pairing {mask(address)}; " + reason)
+        write_last(now)
+        try:
+            backup_bond(adapter, address)
+        except OSError as err:
+            log(f"backup: failed ({type(err).__name__}: {err.strerror}); "
+                "not removing the pen")
+            return
+        if repair(address, adapter):
+            log("result: pen re-paired and connected")
+        else:
+            self.given_up = True
+            log("result: automatic re-pair FAILED; giving up until the "
+                "service restarts.  By hand: bluetoothctl -> scan le -> "
+                "pair/trust/connect <pen> (hold the pen button if it does "
+                "not advertise).  Bond backups: " + BACKUP_DIR)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--replay")
+    ap.add_argument("--assume-pen", choices=("broken", "healthy"))
+    args = ap.parse_args()
+    if args.assume_pen and not args.replay:
+        ap.error("--assume-pen needs --replay")
+    if args.replay:
+        args.dry_run = True       # a replay never acts on the real pen
+    det = Detector(args)
+    mode = "dry run" if args.dry_run else "active"
+    if args.replay:
+        log(f"start ({mode}), replaying {args.replay}")
+        with open(args.replay, errors="replace") as f:
+            for line in f:
+                if det.feed(line):
+                    det.handle_burst(det.quiet_until - RECHECK_S)
+        return 0
+    log(f"start ({mode}): watching bluetooth.service for >= {THRESHOLD} "
+        f"HoG/PNP_ID errors in {WINDOW_S} s")
+    jc = subprocess.Popen(
+        ("journalctl", "-u", "bluetooth.service", "-f", "-n", "0",
+         "-o", "short-unix", "--no-pager"),
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        errors="replace")
+    for line in jc.stdout:
+        if det.feed(line):
+            try:
+                det.handle_burst(time.time())
+            except Exception as err:      # keep watching
+                log(f"error: {type(err).__name__}: {err}")
+            # lines queued while we were busy must not re-trigger at once
+            det.quiet_until = time.time() + RECHECK_S
+            det.hits.clear()
+    log("journalctl ended, exiting")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

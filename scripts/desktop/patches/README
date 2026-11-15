@@ -1,0 +1,104 @@
+q706f (Lenovo Tab P12 Pro, SM8250) kernel series on top of upstream Linux v7.3.4
+================================================================================
+
+Base: Linux v7.3.4 (stable, tag object 8310b43a724c, commit 7595a62d45ee, 2026-11-10).
+Tarball: https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.3.4.tar.xz
+sha256:  b11b6df8295e8e991ff040b71aaa4994a8b55caa23b6b092907f195b5840fd1f
+         (as listed in kernel.org's v7.x/sha256sums.asc; the PGP signature of that
+         list was not verified here)
+
+The patches apply in file-name order with `patch -p1 -F0` (no fuzz, no offsets needed)
+on a pristine extraction of the tarball. The result is byte-for-byte identical to
+sources/linux-desktop-7.3.4 (verified with `diff -r` on a fresh extraction).
+
+Patches
+-------
+0001-upstream-PCI-qcom-honor-iommu-cells.patch
+    Upstream commit 5121d76cb9dd (v7.4-rc1). The only part of silime's 7.3.0-dev delta
+    that this tablet needs: since v7.3-rc the sm8250.dtsi PCIe iommu-map entries carry
+    two IOMMU cells, and without this fix the BDF-to-SID table for bus 1 (the QCA6390
+    Wi-Fi) is programmed from misparsed cells. silime carried an earlier revision of the
+    same patch; the upstream version is used.
+
+0002-q706f-port-on-v7.3.4.patch
+    The q706f support ( taken from silime
+    7.1.0-dev: board DTS, panel, charger/fuel gauge, CS35L45/AS33970/ES7210 audio,
+    q6afe/sm8250 machine driver changes, haptics, cameras, pogo keyboard/touchpad HID
+    quirks, nb7vpq904m, fastrpc, ...) re-applied on v7.3.4. Differences from the 7.3-rc3
+    version of the patch:
+      - drivers/hid/hid-multitouch.c: MT_QUIRK_NO_MODE_REPORTS is BIT(27) (BIT(26) is
+        MT_QUIRK_IGNORE_FEATURE_ID_MISMATCH upstream now); mt_get_feature() already has
+        the `td` local upstream.
+      - drivers/input/misc/Kconfig: INPUT_QCOM_SPMI_HAPTICS placed after
+        INPUT_PMIC8XXX_PWRKEY (its old neighbour, silime's INPUT_QCOM_HV_HAPTICS, is not
+        carried).
+      - dongwoon,dw9768 binding: only the dw9763 compatible is added (silime's dw9800k
+        entry is not carried).
+      - drivers/misc/fastrpc.c: sits on top of the reworked upstream Audio PD
+        remote-heap code (v7.3 final); no functional change to the patch.
+
+0101 ... 0111  (the project patches; numbered as in the older, unpublished 7.1 series + 100)
+    0101 goodix-berlin stylus support            0107 battery charge limits (DTS + charger)
+    0102 DTS: stylus + speakers-only sound       0109 goodix-berlin stylus tip/hover/tilt
+    0104 DTS: CTN730 pen charger                 0110 pm8150b charger ICL + thermal
+    0105 pogo keyboard SW_TABLET_MODE            0111 as33970: no firmware download at probe
+    0106 panel amsa26zp01 60 Hz
+    The *.needs-approval patches of the project are not part of the series.
+
+Not applied: *.pending and *.needs-approval
+-------------------------------------------
+build-kernel.sh only applies *.patch. Files ending in .pending (0112-0115, 0203a-e,
+0204-0206) are prepared patches that are not yet integrated into the series. The kernel
+the author runs on the tablet (7.3.4 "B3af") is this series plus 0113, 0114, 0203a-e,
+0204, 0205, 0206 and the two proposals 0014/0015; 0112 and 0115 are untested. Files
+ending in .needs-approval (0008, 0011b, 0012, 0014, 0015) are proposals only: some of
+them touch persistent state (PMIC SDAM) or have not been validated. Read the header of
+each before renaming it to .patch.
+
+0201-backport-ufs-qcom-enable-only-lane-clocks.patch
+    Upstream commit f07317a8d57f (v7.4-rc1). Replaces the project's pending
+    0013-ufs-qcom-lane-clks-enable-balance.patch.needs-approval (same bug; the upstream
+    fix also contains the "already enabled" check that 0013 adds).
+
+0202-backport-sm8250-gcc-cx-power-domain.patch
+    Upstream commit 389a0144c511 (v7.4-rc1), DT only: GCC GDSCs become subdomains of
+    RPMh CX. Works with the v7.3.4 gdsc code (gdsc_register() parents the GDSCs to the
+    provider's power domain); the 7.4 driver clean-up 361b375a4bb1 is not required.
+    Drop this patch first if a GDSC consumer misbehaves.
+
+Evaluated and not applied
+-------------------------
+ath11k "fix unbalanced IRQ enable/disable during suspend/resume"
+    Upstream commit e56c9d429ba0. It fixes a regression introduced by f7a74e131d3f
+    ("wifi: ath11k: disable interrupts during firmware crash recovery"), which is in
+    v7.4-rc only and is not in v7.3.4; the patch does not apply and there is nothing to
+    fix on 7.3.4.
+
+Dropped from silime 7.3.0-dev
+-----------------------------
+silime's 7.3.0-dev is SM8550 (Meizu 20 Infinity) work on top of a post-rc3 mainline
+snapshot; it has no q706f support. Everything except the PCIe fix above is dropped, see
+docs/KERNEL-7.3.4-STARE.md for the list and the reasons.
+
+Recreating the tree and building
+--------------------------------
+    scripts/desktop/build-kernel.sh     # tarball (sha256 checked) + this series -> sources/linux-desktop,
+                                        # config, Image.gz, dtbs, modules -> out/desktop/kernel/
+    scripts/desktop/kernel-cycle.sh build   # the above + ctn730 module + out/desktop/ubuntu-boot.img
+
+By hand:
+    tar -xf linux-7.3.4.tar.xz && cd linux-7.3.4
+    for p in /path/to/scripts/desktop/patches/[0-9]*.patch; do patch -p1 -F0 < "$p"; done
+
+Do not use `git apply` from inside a subdirectory of another git work tree: it silently
+skips files outside that subdirectory.
+
+Config: scripts/desktop/config-pmos-q706f-6.11 -> olddefconfig -> merge_config with
+q706f-desktop.config, q706f-7.3-renames.config, q706f-7.3.4-extra.config -> olddefconfig.
+Kernel release string: 7.3.4 (LOCALVERSION is forced empty).
+
+Not applied
+-----------
+*.needs-approval files in this directory are proposals waiting for the owner's decision
+(they still apply cleanly on this tree). The former 7.1 series is kept for reference in
+../patches-7.1/ (0013 there is superseded by 0201 here).

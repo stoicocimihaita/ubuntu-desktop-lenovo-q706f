@@ -1,0 +1,4 @@
+# q706f: pen detection off while the pen is docked on the CTN730 charger, on when removed.
+ACTION=="add|change", SUBSYSTEM=="misc", KERNEL=="ctn730", RUN+="/usr/local/libexec/q706f-pen-mode"
+# The touch driver comes up with pen detection on; re-apply the dock state when it binds.
+ACTION=="bind", SUBSYSTEM=="spi", DRIVER=="goodix-berlin-spi", RUN+="/usr/local/libexec/q706f-pen-mode"

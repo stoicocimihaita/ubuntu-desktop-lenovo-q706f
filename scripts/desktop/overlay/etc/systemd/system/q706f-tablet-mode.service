@@ -1,0 +1,20 @@
+[Unit]
+Description=SW_TABLET_MODE switch from the pogo keyboard MCU status (q706f)
+Documentation=file:/usr/local/sbin/q706f-tablet-mode
+# Not needed (and harmless) once the kernel provides the switch itself (patch 0005).
+ConditionPathExists=/dev/uinput
+ConditionPathExists=!/sys/bus/hid/drivers/lenovo-q706f-kbd
+After=systemd-udevd.service
+Before=display-manager.service
+
+[Service]
+ExecStart=/usr/local/sbin/q706f-tablet-mode
+Restart=on-failure
+RestartSec=3
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

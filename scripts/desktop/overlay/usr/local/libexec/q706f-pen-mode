@@ -1,0 +1,15 @@
+#!/bin/sh
+# q706f: tell the Goodix touch controller whether to look for the pen, like the stock
+# Lenovo driver: pen detection off while the pen sits on the CTN730 wireless charger
+# (docked), on when it is taken off. Needs the pen_mode attribute of patch 0113.
+# Usage: q706f-pen-mode [0|1]   (default: derive from the CTN730 "attached" state)
+PM=/sys/bus/spi/devices/spi13.0/pen_mode
+[ -w "$PM" ] || exit 0
+if [ -n "$1" ]; then
+  want="$1"
+else
+  att=$(cat /sys/class/misc/ctn730/attached 2>/dev/null) || exit 0
+  [ "$att" = 1 ] && want=0 || want=1
+fi
+[ "$(cat $PM 2>/dev/null)" = "$want" ] && exit 0
+echo "$want" > "$PM" && logger -t q706f-pen-mode "pen detection $( [ "$want" = 1 ] && echo on || echo off )"

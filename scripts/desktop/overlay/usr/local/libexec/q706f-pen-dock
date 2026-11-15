@@ -1,0 +1,434 @@
+#!/usr/bin/python3
+"""q706f-pen-dock: Lenovo Precision Pen 3 dock handling (charger + Bluetooth).
+
+Ubuntu counterpart of the stock Android logic in services.jar,
+com.zui.server.input.styluspen.pen.bluetooth.policy.BluetoothPenConnectPolicy
+(base class com.zui.server.input.base.BaseBluetoothPolicy), firmware
+TB-Q706F_S530352_240807_ROW.  What stock does, and what is mirrored here:
+
+  1. It observes the uevents of the ctn730 misc device
+     (DEVPATH=/devices/virtual/misc/ctn730; ATTACHED, CHARGING_STATE, LEVEL,
+     MAC, WRITEPENDATA) and reads attached / charge_state / level / mac /
+     low_battery from sysfs.  It never writes to the charger for charging:
+     detection and the charging session are done by the chip and the kernel
+     driver alone.                                              -> mirrored
+  2. ATTACHED=1 with a valid MAC (onUeventReceved):
+       bonded, HID disconnected -> connect (setConnectionPolicy ALLOWED)
+       not bonded               -> LE scan filtered on that address, then
+                                   createBond(TRANSPORT_LE); the pairing
+                                   request is confirmed without a dialog.
+                                                                -> mirrored
+     (pairing only with allow_pairing = yes)
+  3. If that scan finds nothing within 5 s stock runs clearBluetoothPair():
+     property sys.lenovobt.pen_pairing=1 -> init.target.rc writes
+     /sys/class/misc/ctn730/pen_cmd -> the driver sends "aa 55 cc 33" to the
+     pen over the NFC application channel; the pen drops its bond, echoes the
+     bytes (uevent WRITEPENDATA=1) and stock scans again for 30 s.
+                                    -> NOT done here, never automatically.
+     This daemon only logs that the pen did not advertise.
+  4. After HID connects stock opens GATT: reads battery level (0x2A19),
+     firmware revision (0x2A26) and serial number (0x2A25), subscribes to
+     battery level and to the vendor characteristic
+     0000fe41-cc7a-482a-984a-7f2ed5b3e512.          -> battery via BlueZ
+     Vendor writes (never needed for charging or for the bond):
+       "03 01 01 01"  writeActiveInfoFlag(), once per pen: marks the
+                      "first activation was reported" flag (telemetry).
+                                                                -> not done
+       "05 02" / "05 01"  writePenGsensorFlag(true/false) on SCREEN_ON /
+                      SCREEN_OFF: pen motion sensor on/off; the pen answers
+                      with a notification 0x82 (on) / 0x81 (off).
+                                    -> optional, see "gsensor" below, off
+  5. UI thresholds (LenovoSystemUI PenControllerImpl): warnings when the pen
+     is not charging and the level drops to 1..20 % and again to <= 5 %.
+                                                            -> log lines
+
+Configuration: /etc/q706f-pen-dock.conf (optional, INI)
+
+  [dock]
+  connect = yes          # connect the docked pen if it is already paired
+  allow_pairing = no     # pair + trust an unknown docked pen (Just Works)
+  scan_timeout = 30      # seconds to look for an unpaired pen's advertising
+  gsensor = keep         # keep | on | off: after a connection write "05 02"
+                         # (on) or "05 01" (off) to the vendor characteristic,
+                         # as stock writePenGsensorFlag() does.  "keep" writes
+                         # nothing.  This is the only host -> pen write here.
+
+State for other programs: /run/q706f-pen-dock/state (key=value lines).
+Bluetooth addresses are never logged or stored; logs show the last octet.
+"""
+import configparser
+import json
+import os
+import select
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+SYSFS = "/sys/class/misc/ctn730"
+DEVPATH = "/devices/virtual/misc/ctn730"
+CONF = "/etc/q706f-pen-dock.conf"
+STATE_DIR = "/run/q706f-pen-dock"
+PEN_NAME = "Lenovo Precision Pen 3"      # persist.sys.lenovo.btpen.name
+VENDOR_CHAR = "0000fe41-cc7a-482a-984a-7f2ed5b3e512"
+GSENSOR_ON, GSENSOR_OFF = (0x05, 0x02), (0x05, 0x01)
+NETLINK_KOBJECT_UEVENT = 15
+REFRESH_S = 60
+BLUEZ = "org.bluez"
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def mask(mac):
+    return "**:**:**:**:**:" + mac[-2:] if mac else "-"
+
+
+def valid_mac(mac):
+    parts = (mac or "").split(":")
+    if len(parts) != 6 or mac == "00:00:00:00:00:00":
+        return False
+    return all(len(p) == 2 and all(c in "0123456789ABCDEF" for c in p)
+               for p in parts)
+
+
+def sysfs(name):
+    try:
+        with open(os.path.join(SYSFS, name)) as f:
+            return f.readline().strip()
+    except OSError:
+        return None
+
+
+def load_config():
+    cfg = {"connect": True, "allow_pairing": False, "scan_timeout": 30,
+           "gsensor": "keep"}
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(CONF)
+        if parser.has_section("dock"):
+            sec = parser["dock"]
+            cfg["connect"] = sec.getboolean("connect", cfg["connect"])
+            cfg["allow_pairing"] = sec.getboolean("allow_pairing",
+                                                  cfg["allow_pairing"])
+            cfg["scan_timeout"] = max(5, min(120, sec.getint(
+                "scan_timeout", cfg["scan_timeout"])))
+            gsensor = sec.get("gsensor", cfg["gsensor"]).strip().lower()
+            if gsensor in ("keep", "on", "off"):
+                cfg["gsensor"] = gsensor
+            else:
+                log("config: unknown gsensor value, using 'keep'")
+    except (configparser.Error, ValueError) as err:
+        log(f"config: {CONF}: {type(err).__name__}, using defaults")
+    return cfg
+
+
+# --------------------------------------------------------------- BlueZ ---
+
+def busctl(*args, timeout=45):
+    """Run busctl on the system bus; return (ok, parsed JSON or None)."""
+    try:
+        res = subprocess.run(("busctl", "--system", "--json=short") + args,
+                             capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return False, None
+    if res.returncode != 0:
+        return False, None
+    try:
+        return True, json.loads(res.stdout) if res.stdout.strip() else None
+    except ValueError:
+        return True, None
+
+
+def bluez_objects():
+    """{object path: {interface: {property: value}}} or {} without BlueZ."""
+    ok, reply = busctl("call", BLUEZ, "/", "org.freedesktop.DBus.ObjectManager",
+                       "GetManagedObjects")
+    if not ok or not reply:
+        return {}
+    out = {}
+    for path, ifaces in reply["data"][0].items():
+        out[path] = {iface: {k: v.get("data") for k, v in props.items()}
+                     for iface, props in ifaces.items()}
+    return out
+
+
+def find_device(objects, mac=None):
+    """Device path + properties by address, else a connected pen by name."""
+    by_name = None
+    for path, ifaces in objects.items():
+        dev = ifaces.get("org.bluez.Device1")
+        if not dev:
+            continue
+        if mac and dev.get("Address", "").upper() == mac:
+            return path, ifaces
+        if (not mac and dev.get("Connected")
+                and PEN_NAME in (dev.get("Name") or "")):
+            by_name = (path, ifaces)
+    return by_name or (None, None)
+
+
+def adapter_powered(objects):
+    return any(i.get("org.bluez.Adapter1", {}).get("Powered")
+               for i in objects.values())
+
+
+def device_call(path, method, timeout=45):
+    ok, _ = busctl("call", BLUEZ, path, "org.bluez.Device1", method,
+                   timeout=timeout)
+    return ok
+
+
+def write_gsensor(objects, dev_path, on):
+    """Stock writePenGsensorFlag(): "05 02" (on) / "05 01" (off), write
+    with response, to the vendor characteristic.  Only with gsensor=on|off."""
+    value = GSENSOR_ON if on else GSENSOR_OFF
+    for path, ifaces in objects.items():
+        char = ifaces.get("org.bluez.GattCharacteristic1")
+        if (char and path.startswith(dev_path + "/")
+                and (char.get("UUID") or "").lower() == VENDOR_CHAR):
+            ok, _ = busctl("call", BLUEZ, path, "org.bluez.GattCharacteristic1",
+                           "WriteValue", "aya{sv}", str(len(value)),
+                           *[str(b) for b in value], "1", "type", "s",
+                           "request")
+            log(f"pen motion sensor {'on' if on else 'off'}: "
+                f"{'written' if ok else 'write failed'}")
+            return ok
+    log("pen motion sensor: vendor characteristic not found")
+    return False
+
+
+class Dock:
+    def __init__(self):
+        self.cfg = load_config()
+        self.attached = False
+        self.mac = ""              # memory only
+        self.charge_state = "Unknown"
+        self.level = -1
+        self.low_mark = 0          # 0 none, 20, 5: last warning issued
+        self.lock = threading.Lock()
+        self.worker = None
+        self.generation = 0
+
+    # ------------------------------------------------------- state file --
+    def publish(self):
+        objects = bluez_objects()
+        path, ifaces = find_device(objects, self.mac or None)
+        dev = (ifaces or {}).get("org.bluez.Device1", {})
+        bt_level = (ifaces or {}).get("org.bluez.Battery1", {}).get("Percentage")
+        lines = [
+            f"attached={int(self.attached)}",
+            f"charging_state={self.charge_state}",
+            f"level={self.level}",
+            f"bt_paired={int(bool(dev.get('Paired')))}",
+            f"bt_connected={int(bool(dev.get('Connected')))}",
+            f"bt_level={bt_level if bt_level is not None else -1}",
+        ]
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            tmp = os.path.join(STATE_DIR, "state.tmp")
+            with open(tmp, "w") as f:
+                f.write("\n".join(lines) + "\n")
+            os.replace(tmp, os.path.join(STATE_DIR, "state"))
+        except OSError:
+            pass
+        best = self.level if self.level >= 0 else (
+            bt_level if bt_level is not None else -1)
+        self.check_low(best)
+
+    def check_low(self, level):
+        # LenovoSystemUI PenControllerImpl: 1..20 % and <= 5 %, not charging
+        if not 1 <= level <= 20 or self.charge_state == "Charging":
+            self.low_mark = 0
+            return
+        mark = 5 if level <= 5 else 20
+        if mark != self.low_mark and (self.low_mark == 0 or mark < self.low_mark):
+            self.low_mark = mark
+            log(f"pen battery low: {level} %")
+
+    # ----------------------------------------------------------- events --
+    def update(self, attached, mac, charge_state, level, source):
+        mac = (mac or "").upper()
+        was = self.attached
+        self.attached = attached == "1"
+        self.charge_state = charge_state or "Unknown"
+        try:
+            self.level = int(level) if level not in (None, "") else -1
+        except ValueError:
+            self.level = -1
+        if not self.attached:
+            if was:
+                log("pen removed from the dock")
+            self.generation += 1      # cancels a pending scan/pair
+            self.publish()
+            return
+        if not was:
+            log("pen docked")
+        log(f"{source}: {self.charge_state}, level "
+            f"{self.level if self.level >= 0 else 'unknown'}")
+        if valid_mac(mac) and mac != self.mac:
+            self.mac = mac
+            self.start_connect()
+        elif valid_mac(mac) and not was:
+            self.start_connect()
+        self.publish()
+
+    def start_connect(self):
+        if not self.cfg["connect"]:
+            return
+        with self.lock:
+            if self.worker and self.worker.is_alive():
+                return
+            self.generation += 1
+            self.worker = threading.Thread(
+                target=self.connect, args=(self.mac, self.generation),
+                daemon=True)
+            self.worker.start()
+
+    def cancelled(self, generation):
+        return generation != self.generation
+
+    # ----------------------------------------------- Bluetooth sequence --
+    def connect(self, mac, generation):
+        try:
+            self._connect(mac, generation)
+        except Exception as err:      # never let the worker die silently
+            log(f"bluetooth: {type(err).__name__}")
+        self.publish()
+
+    def _connect(self, mac, generation):
+        objects = bluez_objects()
+        if not objects:
+            log("bluetooth: BlueZ is not running, nothing done")
+            return
+        if not adapter_powered(objects):
+            # stock: broadcast PEN_NEED_OPENBT, SystemUI asks the user
+            log("bluetooth: adapter is off, pen not connected")
+            return
+        path, ifaces = find_device(objects, mac)
+        dev = (ifaces or {}).get("org.bluez.Device1", {})
+        if path and dev.get("Paired"):
+            if dev.get("Connected"):
+                log(f"bluetooth: pen {mask(mac)} already connected")
+            else:
+                ok = device_call(path, "Connect")
+                log(f"bluetooth: connect {mask(mac)}: "
+                    f"{'ok' if ok else 'failed'}")
+                if not ok:
+                    return
+            self.after_connect(path)
+            return
+        if not self.cfg["allow_pairing"]:
+            log(f"bluetooth: pen {mask(mac)} is not paired; "
+                "allow_pairing is off")
+            return
+        path = self.scan_for(mac, generation)
+        if not path:
+            if not self.cancelled(generation):
+                # stock would now send the un-pair command (pen_cmd); we don't
+                log(f"bluetooth: pen {mask(mac)} is not advertising "
+                    "(bonded to another host?); hold its button to pair")
+            return
+        if not device_call(path, "Pair", timeout=60):
+            log(f"bluetooth: pairing {mask(mac)} failed")
+            return
+        busctl("set-property", BLUEZ, path, "org.bluez.Device1", "Trusted",
+               "b", "true")
+        log(f"bluetooth: paired and trusted {mask(mac)}")
+        _, ifaces = find_device(bluez_objects(), mac)
+        if not (ifaces or {}).get("org.bluez.Device1", {}).get("Connected"):
+            device_call(path, "Connect")
+        self.after_connect(path)
+
+    def scan_for(self, mac, generation):
+        """LE discovery until the address shows up (stock: filtered LE scan)."""
+        timeout = self.cfg["scan_timeout"]
+        try:
+            scan = subprocess.Popen(
+                ("bluetoothctl", "--timeout", str(timeout), "scan", "le"),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+        except OSError:
+            log("bluetooth: bluetoothctl not available, cannot scan")
+            return None
+        try:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline and not self.cancelled(generation):
+                path, ifaces = find_device(bluez_objects(), mac)
+                dev = (ifaces or {}).get("org.bluez.Device1", {})
+                if path and dev.get("RSSI") is not None:
+                    return path
+                time.sleep(1)
+        finally:
+            scan.terminate()
+            try:
+                scan.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                scan.kill()
+        return None
+
+    def after_connect(self, path):
+        if self.cfg["gsensor"] == "keep":
+            return
+        for _ in range(10):           # wait for GATT discovery
+            objects = bluez_objects()
+            dev = objects.get(path, {}).get("org.bluez.Device1", {})
+            if dev.get("ServicesResolved"):
+                write_gsensor(objects, path, self.cfg["gsensor"] == "on")
+                return
+            time.sleep(1)
+        log("pen motion sensor: services not resolved, nothing written")
+
+    # -------------------------------------------------------- main loop --
+    def read_sysfs(self, source):
+        attached = sysfs("attached")
+        if attached is None:
+            return False
+        self.update(attached, sysfs("mac"), sysfs("charge_state"),
+                    sysfs("level"), source)
+        return True
+
+    def run(self):
+        sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM,
+                             NETLINK_KOBJECT_UEVENT)
+        sock.bind((0, 1))             # group 1: kernel uevents
+        log(f"listening for {DEVPATH} uevents "
+            f"(connect={self.cfg['connect']}, "
+            f"allow_pairing={self.cfg['allow_pairing']}, "
+            f"gsensor={self.cfg['gsensor']})")
+        if not self.read_sysfs("initial state"):
+            log(f"{SYSFS} not present yet (ctn730 module not loaded?)")
+            self.publish()
+        while True:
+            ready, _, _ = select.select([sock], [], [], REFRESH_S)
+            if not ready:
+                self.publish()        # refresh the Bluetooth battery level
+                continue
+            try:
+                data = sock.recv(65536)
+            except OSError:
+                continue
+            fields = data.split(b"\0")
+            env = dict(f.decode("ascii", "replace").split("=", 1)
+                       for f in fields[1:] if b"=" in f)
+            if env.get("DEVPATH") != DEVPATH:
+                continue
+            if env.get("ACTION") == "add":
+                self.read_sysfs("device added")
+                continue
+            if "ATTACHED" not in env:
+                continue
+            if "WRITEPENDATA" in env:
+                # answer to pen_cmd / param; this daemon never sends either
+                log(f"pen data channel result: {env['WRITEPENDATA']}")
+            self.update(env.get("ATTACHED"), env.get("MAC"),
+                        env.get("CHARGING_STATE"), env.get("LEVEL"), "uevent")
+
+
+if __name__ == "__main__":
+    try:
+        Dock().run()
+    except KeyboardInterrupt:
+        sys.exit(0)

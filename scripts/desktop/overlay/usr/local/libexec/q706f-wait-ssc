@@ -1,0 +1,17 @@
+#!/bin/sh
+# Wait (up to ~60 s) until the Qualcomm sensor core on the SLPI answers,
+# so that iio-sensor-proxy finds the SSC sensors when it starts.
+# Always exits 0: iio-sensor-proxy must start even without sensors.
+SSCCLI=/usr/local/bin/ssccli
+[ -x "$SSCCLI" ] || exit 0
+i=0
+while [ "$i" -lt 12 ]; do
+	if timeout 5 "$SSCCLI" --sensor accelerometer --timeout 1 2>/dev/null \
+			| grep -q "measurement"; then
+		exit 0
+	fi
+	i=$((i + 1))
+	sleep 1
+done
+echo "q706f-wait-ssc: SSC accelerometer did not answer, continuing anyway" >&2
+exit 0

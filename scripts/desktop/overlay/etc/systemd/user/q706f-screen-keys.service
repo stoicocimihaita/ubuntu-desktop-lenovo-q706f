@@ -1,0 +1,13 @@
+[Unit]
+Description=Tablet-style power button and cover handling (q706f)
+Documentation=file:/usr/local/libexec/q706f-screen-keys
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/local/libexec/q706f-screen-keys
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

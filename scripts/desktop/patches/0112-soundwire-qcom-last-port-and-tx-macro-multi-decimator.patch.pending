@@ -1,0 +1,127 @@
+From: silime <chalkin@yeah.net>
+Subject: [PATCH] soundwire: qcom: allow the last port; ASoC: lpass-tx-macro: track every active decimator
+
+Status: PREPARED, NOT TESTED ON THE TABLET (.pending is not applied by
+build-kernel.sh; rename to .patch once the microphone test passes).
+
+Origin: the two hunks are the drivers/soundwire/qcom.c and
+sound/soc/codecs/lpass-tx-macro.c parts of silime's commit
+fb5e4a2e4b06f6a0cd64eaedc868803b5a06e579 ("ASoC: qcom: add calibrated
+AudioReach modem voice on Meizu", 2026-10-11, branch 7.3.0-dev of
+github.com/silime/linux). The rest of that commit (Meizu/AudioReach voice)
+is not carried. Neither change is in silime 7.1.0-dev (which used plain
+upstream v7.1 versions of both files) nor in mainline up to v7.4-rc2.
+
+1) soundwire: qcom: include the last one-based port in the port search
+
+   Upstream 6ccec91c3535 ("soundwire: qcom: Fix port exhaustion check in
+   stream_alloc_ports", v7.3-rc1) changed `pn > maxport` to `pn >= maxport`
+   while maxport stayed ctrl->nports. Port numbers are 1..nports (bit 0 of
+   port_mask is reserved), so since v7.3 the highest port of every master
+   is refused with "All ports busy" (-EBUSY), whether it comes from the
+   static qcom,{rx,tx}-port-mapping or from find_first_zero_bit(). With
+   maxport = nports + 1 the exhaustion check stays correct and port
+   `nports` is usable again. On q706f this is master port 5 on swr1 (RX,
+   WCD938x DSD) and on swr2 (TX, WCD938x DMIC4_7); the internal microphones
+   (ADC1/ADC2 -> WCD938x port 1 -> swr2 port 2) do not use it, so this hunk
+   is a correctness fix rather than the expected mic fix.
+
+2) ASoC: codecs: lpass-tx-macro: track every active decimator per DAI
+
+   tx_macro_tx_mixer_put() kept a single active_decimator per DAI. The q706f
+   UCM puts two decimators (DEC0 = AMIC1, DEC1 = AMIC3) on TX_AIF1_CAP. With
+   one slot, disabling DEC0 sets the slot to -1 and the following DEC1
+   disable returns early: DEC1 stays in active_ch_mask, active_ch_cnt never
+   reaches 0 and the DAPM mixer is not updated; every later enable/disable
+   cycle (each PipeWire open/close of the source) increments active_ch_cnt
+   again, which tx_macro_get_channel_map() reports as the TX channel count
+   to the codec DMA. tx_macro_digital_mute() also only (un)muted the last
+   decimator. Use active_ch_mask (already maintained) as the single source
+   of truth and (un)mute all set decimators.
+
+Signed-off-by: silime <chalkin@yeah.net>
+[q706f: extracted the two hunks from fb5e4a2e4b06 and rebased on v7.3.4 +
+ the q706f series; commit message written for this project]
+---
+--- a/drivers/soundwire/qcom.c
++++ b/drivers/soundwire/qcom.c
+@@ -1272,7 +1272,8 @@
+ 			continue;
+ 
+ 		port_mask = &ctrl->port_mask;
+-		maxport = ctrl->nports;
++		/* Port zero is reserved; include the last one-based port. */
++		maxport = ctrl->nports + 1;
+ 
+ 		list_for_each_entry(s_rt, &m_rt->slave_rt_list, m_rt_node) {
+ 			slave = s_rt->slave;
+--- a/sound/soc/codecs/lpass-tx-macro.c
++++ b/sound/soc/codecs/lpass-tx-macro.c
+@@ -272,7 +272,6 @@
+ 	struct tx_mute_work tx_mute_dwork[NUM_DECIMATORS];
+ 	unsigned long active_ch_mask[TX_MACRO_MAX_DAIS];
+ 	unsigned long active_ch_cnt[TX_MACRO_MAX_DAIS];
+-	int active_decimator[TX_MACRO_MAX_DAIS];
+ 	struct regmap *regmap;
+ 	struct clk *mclk;
+ 	struct clk *npl;
+@@ -889,19 +888,17 @@
+ 	struct tx_macro *tx = snd_soc_component_get_drvdata(component);
+ 
+ 	if (enable) {
+-		if (tx->active_decimator[dai_id] == dec_id)
++		if (test_bit(dec_id, &tx->active_ch_mask[dai_id]))
+ 			return 0;
+ 
+ 		set_bit(dec_id, &tx->active_ch_mask[dai_id]);
+ 		tx->active_ch_cnt[dai_id]++;
+-		tx->active_decimator[dai_id] = dec_id;
+ 	} else {
+-		if (tx->active_decimator[dai_id] == -1)
++		if (!test_bit(dec_id, &tx->active_ch_mask[dai_id]))
+ 			return 0;
+ 
+ 		tx->active_ch_cnt[dai_id]--;
+ 		clear_bit(dec_id, &tx->active_ch_mask[dai_id]);
+-		tx->active_decimator[dai_id] = -1;
+ 	}
+ 	snd_soc_dapm_mixer_update_power(widget->dapm, kcontrol, enable, update);
+ 
+@@ -1192,22 +1189,12 @@
+ {
+ 	struct snd_soc_component *component = dai->component;
+ 	struct tx_macro *tx = snd_soc_component_get_drvdata(component);
+-	u8 decimator;
+-
+-	/* active decimator not set yet */
+-	if (tx->active_decimator[dai->id] == -1)
+-		return 0;
++	unsigned long decimator;
+ 
+-	decimator = tx->active_decimator[dai->id];
+-
+-	if (mute)
++	for_each_set_bit(decimator, &tx->active_ch_mask[dai->id], NUM_DECIMATORS)
+ 		snd_soc_component_write_field(component,
+ 					      CDC_TXn_TX_PATH_CTL(decimator),
+-					      CDC_TXn_PGA_MUTE_MASK, 0x1);
+-	else
+-		snd_soc_component_update_bits(component,
+-					      CDC_TXn_TX_PATH_CTL(decimator),
+-					      CDC_TXn_PGA_MUTE_MASK, 0x0);
++					      CDC_TXn_PGA_MUTE_MASK, !!mute);
+ 
+ 	return 0;
+ }
+@@ -2314,11 +2301,6 @@
+ 
+ 	tx->dev = dev;
+ 
+-	/* Set active_decimator default value */
+-	tx->active_decimator[TX_MACRO_AIF1_CAP] = -1;
+-	tx->active_decimator[TX_MACRO_AIF2_CAP] = -1;
+-	tx->active_decimator[TX_MACRO_AIF3_CAP] = -1;
+-
+ 	/* set MCLK and NPL rates */
+ 	ret = clk_set_rate(tx->mclk, MCLK_FREQ);
+ 	if (ret)

@@ -1,0 +1,90 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Date: Fri, 14 Nov 2026 00:00:00 +0200
+Subject: [PATCH] libipa: camera_sensor_helper: Add ov13b10, ov8856 and s5k5e9
+
+The Lenovo Tab P12 Pro (TB-Q706F, SM8250) has three camera sensors that
+libcamera 0.7.0 has no CameraSensorHelper for: ov13b10 (main rear),
+s5k5e9 (second rear) and ov8856 (front). Without a helper the software
+ISP of the "simple" pipeline works on raw V4L2 gain codes instead of
+linear gains and logs "Failed to create camera sensor helper".
+
+Gain models, all linear, taken from the Linux 7.3.4 sensor drivers
+(drivers/media/i2c/):
+
+  ov13b10  OV13B10_ANA_GAIN_MIN 0x80, MAX 0x7c0, STEP 1; register 0x3508
+           holds gain * 128 (0x80 = 1x)          -> code / 128
+  ov8856   OV8856_ANAL_GAIN_MIN 128, MAX 2047, STEP 1, same register
+           layout as ov13b10/ov5675/ov13858       -> code / 128
+  s5k5e9   V4L2_CID_ANALOGUE_GAIN 32..1024 written to the SMIA register
+           analogue_gain_code_global (0x0204); code 32 = 1x as on other
+           Samsung SMIA sensors (inferred, no datasheet) -> code / 32
+
+Black level (16-bit scale):
+
+  ov8856   4096: the driver programs the BLC target register 0x4003 = 0x40
+           (64 at 10 bits), the same source as the existing ov5675 helper.
+  ov13b10, s5k5e9: not set. The drivers do not program a BLC target and
+           no datasheet value is available, so the software ISP keeps
+           estimating the black level from the histogram.
+
+Not upstream. Local patch for the q706f Ubuntu port.
+---
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -753,6 +753,19 @@
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("ov64a40", CameraSensorHelperOv64a40)
+ 
++class CameraSensorHelperOv8856 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperOv8856()
++	{
++		/* From Linux kernel driver: 0x40 at 10bits (BLC target 0x4003). */
++		blackLevel_ = 4096;
++		/* Linux kernel driver: code 128 = 1x, 1/128 steps up to 2047. */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 128 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("ov8856", CameraSensorHelperOv8856)
++
+ class CameraSensorHelperOv8858 : public CameraSensorHelper
+ {
+ public:
+@@ -789,6 +802,36 @@
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("ov13858", CameraSensorHelperOv13858)
+ 
++class CameraSensorHelperOv13b10 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperOv13b10()
++	{
++		/*
++		 * Linux kernel driver: code 0x80 = 1x, 1/128 steps up to 0x7c0.
++		 * The driver does not program the BLC target; leave the black
++		 * level unset so that the IPA keeps estimating it.
++		 */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 128 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("ov13b10", CameraSensorHelperOv13b10)
++
++class CameraSensorHelperS5k5e9 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperS5k5e9()
++	{
++		/*
++		 * SMIA-style analogue_gain_code_global (0x0204): the Linux kernel
++		 * driver exposes 32..1024 with code 32 = 1x, as for other Samsung
++		 * SMIA sensors. Black level unknown, left to the IPA estimate.
++		 */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 32 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("s5k5e9", CameraSensorHelperS5k5e9)
++
+ class CameraSensorHelperVd55g1 : public CameraSensorHelper
+ {
+ public:

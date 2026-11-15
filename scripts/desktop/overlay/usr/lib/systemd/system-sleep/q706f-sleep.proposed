@@ -1,0 +1,56 @@
+#!/bin/sh
+# systemd-sleep hook for q706f ($1 = pre|post).
+# - The sensor DSP (SLPI) crashes on resume if the FastRPC daemon was left attached, and
+#   the sensor services then stay down: stop them before sleeping, start them after.
+# - End a pen wireless-charging session cleanly (an interrupted one can corrupt the pen's
+#   NFC tag) and restart detection on resume.
+# - Optionally power the Bluetooth half of the QCA6390 off for the duration of the sleep
+#   (BT_OFF=1 in /etc/default/q706f-sleep; default 0: the pen and BT keyboards reconnect
+#   faster when it stays on, at the cost of the controller's idle current).
+# - Log what the sleep cost: battery charge and the SoC low-power counters. "cxsd +0" /
+#   "aosd +0" means the SoC never power-collapsed CX / never shut the XO down.
+BT_OFF=0
+[ -r /etc/default/q706f-sleep ] && . /etc/default/q706f-sleep
+RUN=/run/q706f-sleep
+BAT=/sys/class/power_supply/bq27541-0
+QS=/sys/kernel/debug/qcom_stats
+
+cnt() { sed -n 's/^Count: //p' "$QS/$1" 2>/dev/null | head -n1; }
+snap() {
+  # boottime-seconds charge_uAh cxsd aosd ddr adsp cdsp slpi
+  echo "$(cut -d' ' -f1 /proc/uptime | cut -d. -f1) $(cat $BAT/charge_now 2>/dev/null || echo 0)" \
+       "$(cnt cxsd) $(cnt aosd) $(cnt ddr) $(cnt adsp) $(cnt cdsp) $(cnt slpi)"
+}
+
+case "$1" in
+  pre)
+    systemctl stop iio-sensor-proxy.service hexagonrpcd.service 2>/dev/null
+    [ -e /sys/class/misc/ctn730/enable ] && echo 0 > /sys/class/misc/ctn730/enable
+    mkdir -p "$RUN"
+    rm -f "$RUN/bt-was-on"
+    if [ "$BT_OFF" = 1 ] && rfkill list bluetooth 2>/dev/null | grep -q 'Soft blocked: no'; then
+      touch "$RUN/bt-was-on"
+      rfkill block bluetooth
+    fi
+    sleep 1
+    snap > "$RUN/pre"
+    ;;
+  post)
+    if [ -r "$RUN/pre" ]; then
+      read -r t0 c0 x0 a0 d0 q0 k0 s0 < "$RUN/pre"
+      read -r t1 c1 x1 a1 d1 q1 k1 s1 <<EOF
+$(snap)
+EOF
+      dt=$((t1 - t0)); [ "$dt" -gt 0 ] || dt=1
+      duah=$((c0 - c1))
+      logger -t q706f-sleep "slept ${dt}s, battery $((duah / 1000)) mAh (avg $((duah * 36 / dt / 10)) mA)," \
+        "cxsd +$((x1 - x0)) aosd +$((a1 - a0)) ddr +$((d1 - d0)) adsp +$((q1 - q0)) cdsp +$((k1 - k0)) slpi +$((s1 - s0))"
+      rm -f "$RUN/pre"
+    fi
+    [ -e "$RUN/bt-was-on" ] && { rfkill unblock bluetooth; rm -f "$RUN/bt-was-on"; }
+    [ -e /sys/class/misc/ctn730/enable ] && echo 1 > /sys/class/misc/ctn730/enable
+    systemctl start hexagonrpcd.service 2>/dev/null
+    systemctl --no-block start iio-sensor-proxy.service 2>/dev/null
+    ;;
+esac
+exit 0

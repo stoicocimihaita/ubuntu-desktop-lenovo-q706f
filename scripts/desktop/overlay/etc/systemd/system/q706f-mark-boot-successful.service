@@ -1,0 +1,14 @@
+[Unit]
+Description=Mark the running A/B slot as boot-successful for the bootloader (q706f)
+# Only after the system has been up for a while with the desktop started, so a kernel
+# that boots but breaks the system does not get marked (ABL then falls back to the
+# other slot after its retries).
+After=multi-user.target graphical.target ssh.service NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 90
+ExecStart=/usr/local/sbin/q706f-mark-boot-successful
+
+[Install]
+WantedBy=multi-user.target

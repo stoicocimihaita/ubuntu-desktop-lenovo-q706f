@@ -1,0 +1,53 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] drm/panel: samsung-amsa26zp01: hand the probe-time supply vote to prepare()
+
+probe() enables vddio/vdd so the panel keeps power until the first modeset,
+and prepare() enabled them again. unprepare() only drops one vote, so after
+the first enable the supplies (L11C 3.3 V, L14A 1.8 V on q706f) stayed on
+forever: with the screen blanked and in suspend the panel was held in reset
+but powered.
+
+Let the first prepare() take over the probe vote instead of adding one.
+
+--- a/drivers/gpu/drm/panel/panel-samsung-amsa26zp01.c
++++ b/drivers/gpu/drm/panel/panel-samsung-amsa26zp01.c
+@@ -27,6 +27,8 @@
+ 	struct drm_dsc_config dsc;
+ 	struct gpio_desc *reset_gpio;
+ 	struct regulator_bulk_data supplies[2];
++	/* supplies were enabled at probe and not yet handed over to prepare() */
++	bool supplies_from_probe;
+ 	struct drm_connector *connector;
+ };
+ 
+@@ -122,9 +124,18 @@
+ 	struct drm_dsc_picture_parameter_set pps;
+ 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
+ 
+-	dsi_ctx.accum_err = regulator_bulk_enable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
+-	if (dsi_ctx.accum_err)
+-		return dsi_ctx.accum_err;
++	/*
++	 * probe() keeps the supplies on so the panel does not lose power before
++	 * the first modeset; the first prepare() takes over that vote instead of
++	 * adding a second one that unprepare() would never drop.
++	 */
++	if (ctx->supplies_from_probe) {
++		ctx->supplies_from_probe = false;
++	} else {
++		dsi_ctx.accum_err = regulator_bulk_enable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
++		if (dsi_ctx.accum_err)
++			return dsi_ctx.accum_err;
++	}
+ 
+ 	samsung_amsa26zp01_reset(ctx);
+ 
+@@ -267,6 +278,8 @@
+ 	ret = regulator_bulk_enable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
+ 	if (ret)
+ 		dev_err(dev, "Failed to enable regulators: %d\n", ret);
++	else
++		ctx->supplies_from_probe = true;
+ 
+ 	ctx->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+ 	if (IS_ERR(ctx->reset_gpio))

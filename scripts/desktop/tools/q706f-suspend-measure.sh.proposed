@@ -1,0 +1,121 @@
+#!/bin/sh
+# Measure one s2idle cycle on the tablet (kernel 7.3.4 and the 7.3.4-power test kernels).
+# Run as root ON THE TABLET, on battery (charger and USB power unplugged), owner present:
+#   sudo sh q706f-suspend-measure.sh [seconds=600] [label]
+# Over ssh use a terminal (ssh -t): the script asks the owner to confirm being present.
+# Proposed tool, not installed by the rootfs build.
+#
+# Read-only apart from the suspend itself: it reads the fuel gauge, qcom_stats,
+# wakeup_sources and devlink state; it loads the read-only qcom_stats module if needed;
+# it never touches the backlight/brightness, partitions or chip firmware.
+# rtcwake bypasses systemd-sleep, so the INSTALLED hook is called by hand (pre/post),
+# exactly as systemd would (it stops the sensor services and the pen charger first).
+# Over Wi-Fi the ssh session may drop during the sleep: the script carries on and the
+# result stays in the log (read it with: sudo tail -n 12 /var/log/q706f-suspend-measure.log).
+# Results: appended to /var/log/q706f-suspend-measure.log; raw snapshots in
+# /var/log/q706f-suspend-measure/<timestamp>/ (no serials, MACs, SSIDs or IPs).
+set -u
+SECS="${1:-600}"; LABEL="${2:-}"
+BAT=/sys/class/power_supply/bq27541-0
+QS=/sys/kernel/debug/qcom_stats
+WS=/sys/kernel/debug/wakeup_sources
+HOOK=/usr/lib/systemd/system-sleep/q706f-sleep
+LOG=/var/log/q706f-suspend-measure.log
+die() { echo "q706f-suspend-measure: $*" >&2; exit 1; }
+
+[ "$(id -u)" = 0 ] || die "run as root (sudo)"
+case "$SECS" in ''|*[!0-9]*) die "seconds must be a number";; esac
+[ "$SECS" -ge 60 ] && [ "$SECS" -le 7200 ] || die "seconds must be 60..7200"
+[ -d "$BAT" ] || die "fuel gauge $BAT not found"
+
+# 1. Charger unplugged: any online USB/Mains supply, or a charging battery, spoils the number.
+for p in /sys/class/power_supply/*; do
+  [ "$(cat "$p/type" 2>/dev/null)" = Battery ] && continue
+  [ "$(cat "$p/online" 2>/dev/null)" = 1 ] && die "$(basename "$p") is online: unplug the charger/USB cable first"
+done
+case "$(cat $BAT/status)" in Charging|Full) die "battery status is $(cat $BAT/status): unplug the charger";; esac
+
+# 2. A wake request pending from q706f-screen-keys would turn the cycle into a 2 s one.
+for f in /run/user/*/q706f-wake-intent; do
+  [ -e "$f" ] && die "a wake-intent marker is pending ($f); wait a few seconds and retry"
+done
+
+# 3. Owner present (rule: no suspend without the owner next to the tablet).
+[ -t 0 ] || die "needs a terminal for the owner's confirmation (use ssh -t)"
+printf 'Suspend for %s s (wake by RTC). Owner next to the tablet, charger unplugged? [yes/N] ' "$SECS"
+read -r ans; [ "$ans" = yes ] || die "not confirmed"
+# An ssh session over Wi-Fi may drop while the tablet sleeps: never let a hang-up or a
+# broken pipe kill the script between the "pre" and "post" hook calls.
+trap '' HUP PIPE
+
+mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug
+[ -d "$QS" ] || modprobe qcom_stats 2>/dev/null
+[ -d "$QS" ] || echo "warning: $QS missing (CONFIG_QCOM_STATS); SoC counters will be empty"
+
+TS=$(date +%Y%m%d-%H%M%S); RAW=/var/log/q706f-suspend-measure/$TS; mkdir -p "$RAW"
+cnt() { v=$(sed -n 's/^Count: //p' "$QS/$1" 2>/dev/null | head -n1); echo "${v:-0}"; }
+stats() { for s in cxsd aosd ddr apss adsp cdsp slpi; do printf '%s=%s ' "$s" "$(cnt $s)"; done; }
+unsynced() { for f in $(find /sys/devices -name state_synced 2>/dev/null); do
+  [ "$(cat "$f")" = 0 ] && printf '%s ' "$(basename "$(dirname "$f")")"; done; }
+icc_max() { grep -c 2147483647 /sys/kernel/debug/interconnect/interconnect_summary 2>/dev/null; }
+cur_avg() {  # mean of 5 current_now samples (uA, sign as reported by bq27xxx), 1 s apart
+  t=0; for i in 1 2 3 4 5; do t=$((t + $(cat $BAT/current_now))); sleep 1; done; echo $((t / 5)); }
+gmu() { d=$(ls -d /sys/bus/platform/devices/*.gmu 2>/dev/null | head -n1)
+  if [ -z "$d" ]; then echo absent
+  elif [ -e "$d/driver" ]; then basename "$(readlink "$d/driver")"
+  else echo "no driver"; fi; }
+snap_raw() {  # $1 = before|after
+  for s in cxsd aosd ddr apss adsp cdsp slpi; do
+    [ -r "$QS/$s" ] && { echo "== $s"; cat "$QS/$s"; }; done > "$RAW/qcom_stats.$1"
+  cat "$WS" > "$RAW/wakeup_sources.$1" 2>/dev/null
+  cat /sys/kernel/debug/interconnect/interconnect_summary > "$RAW/icc.$1" 2>/dev/null
+  cat /sys/kernel/debug/pm_genpd/pm_genpd_summary > "$RAW/genpd.$1" 2>/dev/null
+}
+
+i0=$(cur_avg)
+{
+echo "=== $(date '+%F %T') ${LABEL} kernel=$(uname -r) $(uname -v | cut -d' ' -f1) secs=$SECS"
+echo "cmdline flags: $(tr ' ' '\n' < /proc/cmdline | grep -E 'ignore_unused|sync_state|fw_devlink' | tr '\n' ' ')"
+echo "gmu driver: $(gmu)   devices_deferred: $(wc -l < /sys/kernel/debug/devices_deferred)"
+echo "unsynced providers: $(unsynced)"
+echo "dmesg sync_state pending: $(dmesg | grep -c 'sync_state() pending')" \
+     "($(dmesg | sed -n 's/.*sync_state() pending due to //p' | sort -u | tr '\n' ' '))"
+echo "icc nodes still at INT_MAX: $(icc_max)"
+echo "awake: current_now avg ${i0} uA, voltage $(cat $BAT/voltage_now) uV, capacity $(cat $BAT/capacity)%"
+echo "before: $(stats) charge_uAh=$(cat $BAT/charge_now) suspend_ok=$(cat /sys/power/suspend_stats/success) fail=$(cat /sys/power/suspend_stats/fail)"
+} > "$RAW/summary.before"
+cat "$RAW/summary.before" >> "$LOG"; cat "$RAW/summary.before" 2>/dev/null
+snap_raw before
+x0=$(cnt cxsd); a0=$(cnt aosd); d0=$(cnt ddr); q0=$(cnt adsp); k0=$(cnt cdsp); s0=$(cnt slpi)
+ok0=$(cat /sys/power/suspend_stats/success)
+
+[ -x "$HOOK" ] && "$HOOK" pre suspend
+sync
+c0=$(cat $BAT/charge_now); t0=$(date +%s)   # wall clock: CLOCK_MONOTONIC stops in s2idle
+rtcwake -m freeze -s "$SECS" >/dev/null 2>"$RAW/rtcwake.err"
+t1=$(date +%s); c1=$(cat $BAT/charge_now)
+[ -x "$HOOK" ] && "$HOOK" post suspend
+sleep 3
+snap_raw after
+i1=$(cur_avg)
+
+dt=$((t1 - t0)); [ "$dt" -gt 0 ] || dt=1
+d=$((c0 - c1)); n=$(( $(cat /sys/power/suspend_stats/success) - ok0 ))
+# Wakeup sources whose event_count grew (debugfs columns: name active_count event_count ...).
+awk 'NR==FNR { if (FNR > 1) b[$1]=$3; next } FNR > 1 && ($3 - b[$1]) > 0 { print $3 - b[$1], $1 }' \
+  "$RAW/wakeup_sources.before" "$RAW/wakeup_sources.after" 2>/dev/null | sort -rn | head -n 8 \
+  | tr '\n' ' ' > "$RAW/wakeup_top"
+{
+echo "after:  $(stats) charge_uAh=$c1 suspend_ok=+$n fail=$(cat /sys/power/suspend_stats/fail)"
+echo "RESULT: ${dt}s wall, $((d / 1000)) mAh, avg $((d * 36 / dt / 10)) mA" \
+     "(fuel-gauge resolution ~1 mAh: use >=1800 s when the result is below ~30 mA);" \
+     "cxsd +$(( $(cnt cxsd) - x0 )) aosd +$(( $(cnt aosd) - a0 )) ddr +$(( $(cnt ddr) - d0 ))" \
+     "adsp +$(( $(cnt adsp) - q0 )) cdsp +$(( $(cnt cdsp) - k0 )) slpi +$(( $(cnt slpi) - s0 ))"
+echo "awake after resume: current_now avg ${i1} uA"
+echo "wakeup sources (+events name): $(cat "$RAW/wakeup_top")"
+echo "last wake irq: $(cat /sys/power/pm_wakeup_irq 2>/dev/null || echo n/a); $(dmesg | grep -E 'PM: (suspend exit|resume)|wakeup' | tail -n 2 | tr '\n' ';')"
+echo "raw snapshots: $RAW"
+[ "$n" -ge 1 ] || echo "WARNING: suspend_stats/success did not increase: the tablet did not suspend ($(cat "$RAW/rtcwake.err"))"
+} > "$RAW/summary.after"
+cat "$RAW/summary.after" >> "$LOG"; cat "$RAW/summary.after" 2>/dev/null
+exit 0

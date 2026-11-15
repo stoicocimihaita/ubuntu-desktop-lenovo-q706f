@@ -1,0 +1,47 @@
+drm/msm/adreno/a6xx: Mark cxpd device_link as stateless
+
+Origin: upstream RFT series "[PATCH RFT 0/5] drm/msm: Attach a driver to GMU",
+        patch 1/5, not merged (v1; v2 announced, not seen on lore by 13.11.2026).
+        https://lore.kernel.org/all/20260513-gmu-sync-state-fix-v1-1-6e33e6aa9b4f@oss.qualcomm.com/
+        Author: Akhil P Oommen <akhilpo@oss.qualcomm.com>, Wed, 13 May 2026 02:22:56 +0530
+        Review: Reviewed-by Dmitry Baryshkov on 1/5, 3/5, 5/5; Tested-by on
+        x1e80100, sm8750, sc8280xp. Not tested on SM8250 / Adreno 650.
+Status: .pending - apply only together with the other 0203* files, for the
+        power test kernel (out/desktop/kernel-power). Rename to .patch to apply.
+
+Original commit message:
+Since the cxpd virtual device is a driverless device, it has no real
+struct device_driver bound it the way a normal platform device does. So,
+the managed lifecycle doesn't map cleanly onto it. Since the lifecycle of
+this device_link is managed by the msm driver, pass DL_FLAG_STATELESS
+together with the existing DL_FLAG_PM_RUNTIME flag.
+
+This fix is required to avoid the below splat when a driver is attached to
+the GMU (WARNING in device_links_driver_bound(), trace trimmed here).
+
+
+Fixes: ead5d3e5eb37 ("drm/msm/a6xx: Vote for cx gdsc from gpu driver")
+Signed-off-by: Akhil P Oommen <akhilpo@oss.qualcomm.com>
+
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c	2026-11-10 20:10:10.000000000 +0200
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c	2026-11-13 17:55:12.581689634 +0200
+@@ -2246,7 +2246,8 @@
+ 		goto err_mmio;
+ 	}
+ 
+-	if (!device_link_add(gmu->dev, gmu->cxpd, DL_FLAG_PM_RUNTIME)) {
++	if (!device_link_add(gmu->dev, gmu->cxpd,
++			     DL_FLAG_PM_RUNTIME | DL_FLAG_STATELESS)) {
+ 		ret = -ENODEV;
+ 		goto detach_cxpd;
+ 	}
+@@ -2432,7 +2433,8 @@
+ 		goto err_mmio;
+ 	}
+ 
+-	link = device_link_add(gmu->dev, gmu->cxpd, DL_FLAG_PM_RUNTIME);
++	link = device_link_add(gmu->dev, gmu->cxpd,
++			       DL_FLAG_PM_RUNTIME | DL_FLAG_STATELESS);
+ 	if (!link) {
+ 		ret = -ENODEV;
+ 		goto detach_cxpd;

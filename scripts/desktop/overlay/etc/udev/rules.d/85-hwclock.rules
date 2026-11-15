@@ -1,0 +1,5 @@
+# q706f: the PMIC RTC is read-only and counts from 1970; the kernel copies it into the
+# system clock when the RTC driver registers (after fake-hwclock already restored the
+# time). Restore the saved time again right after that (udev itself may not set the
+# clock, so start a unit). Also overrides the stock 85-hwclock.rules (hwclock --hctosys).
+ACTION=="add", SUBSYSTEM=="rtc", KERNEL=="rtc0", TAG+="systemd", ENV{SYSTEMD_WANTS}+="q706f-clock-restore.service"

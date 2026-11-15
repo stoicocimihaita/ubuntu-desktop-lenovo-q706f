@@ -1,0 +1,12 @@
+#!/bin/sh
+# At boot WirePlumber can probe the sound card before the WCD938x codec is attached on
+# SoundWire (ASoC -EBUSY errors); the microphone source is then missing until
+# WirePlumber is restarted. Wait for the session's audio to come up and, if the
+# microphone source is absent, restart WirePlumber once.
+i=0
+while [ $i -lt 30 ]; do
+  if wpctl status 2>/dev/null | grep -q "Internal microphones"; then exit 0; fi
+  i=$((i+1)); sleep 1
+  [ $i -eq 12 ] && systemctl --user restart wireplumber.service
+done
+exit 0

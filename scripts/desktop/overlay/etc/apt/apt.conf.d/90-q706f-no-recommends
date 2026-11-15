@@ -1,0 +1,5 @@
+// q706f (Lenovo Tab P12 Pro): never pull Recommends automatically. Recommends of
+// packages used on this tablet include tools that rewrite the A/B slot flags or reboot
+// it (qbootctl, droid-juicer via hexagonrpcd); see also preferences.d/90-q706f-forbidden.
+// Installed by the image (scripts/desktop/overlay) and by q706f-secure.sh --apt-pins.
+APT::Install-Recommends "false";

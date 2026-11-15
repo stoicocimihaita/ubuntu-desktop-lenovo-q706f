@@ -1,0 +1,5 @@
+# Wi-Fi regulatory domain hint, applied by /usr/local/sbin/q706f-regdom at boot.
+#   auto  country of the system timezone (timedatectl set-timezone ...)
+#   XX    explicit ISO 3166-1 alpha-2 country code, e.g. DE
+#   off   do nothing
+REGDOM=auto

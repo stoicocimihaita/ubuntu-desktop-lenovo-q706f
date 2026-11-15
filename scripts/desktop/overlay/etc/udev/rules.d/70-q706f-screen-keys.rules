@@ -1,0 +1,4 @@
+# Let the active local session read the power key and the hall (cover) switch;
+# q706f-screen-keys turns them into "screen off / on".
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="pm8941_pwrkey", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Hall effect sensor", TAG+="uaccess"

@@ -1,0 +1,134 @@
+#!/usr/bin/python3
+"""q706f-thermal: gentle temperature-based CPU/GPU frequency limits.
+
+The mainline thermal zones of SM8250 only start throttling at 90/95 C (passive) and
+110 C (critical); the stock Android tablet throttled much earlier from userspace
+(Qualcomm thermal-engine, on case/skin temperature). Without that the prime core ran at
+3.19 GHz up to 88 C in a stress test, which makes the tablet hot to hold.
+
+This daemon reads the hottest CPU/GPU thermal zone every 2 s and lowers the maximum
+frequency of the big (policy4) and prime (policy7) clusters and of the GPU step by step:
+
+    < 70 C   no limit
+    70 C     prime <= 2.84 GHz
+    75 C     prime <= 2.46, big <= 2.15 GHz, GPU <= 587 MHz
+    80 C     prime <= 2.07, big <= 1.86 GHz, GPU <= 490 MHz
+    85 C     prime <= 1.63, big <= 1.48 GHz, GPU <= 400 MHz
+    (90 C and above: the kernel's own passive trips take over as before)
+
+Limits tighten at once on the raw temperature (hottest CPU or GPU zone); a limit is only
+relaxed one step after the smoothed temperature stayed 5 C below its trigger for 20 s
+continuously, so it does not flap.
+It only writes scaling_max_freq / devfreq max_freq (never voltages, never the trip
+points) and restores the hardware maximum on exit.
+"""
+import glob
+import os
+import signal
+import sys
+import time
+
+STEPS = [  # (temperature C, prime kHz, big kHz, gpu Hz) - None = no limit
+    (70, 2841600, None, None),
+    (75, 2457600, 2150400, 587000000),
+    (80, 2073600, 1862400, 490000000),
+    (85, 1632000, 1478400, 400000000),
+]
+HYST = 5
+PERIOD = 2.0
+ALPHA = 0.3      # smoothing of the temperature (exponential moving average)
+RELAX_AFTER = 20  # seconds a step must hold before it may be relaxed
+POL = {"prime": "/sys/devices/system/cpu/cpufreq/policy7",
+       "big": "/sys/devices/system/cpu/cpufreq/policy4"}
+GPU = next(iter(glob.glob("/sys/class/devfreq/*.gpu")), None)
+
+
+def rd(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def wr(path, value):
+    try:
+        with open(path, "w") as f:
+            f.write(str(value))
+        return True
+    except OSError:
+        return False
+
+
+def zones():
+    out = []
+    for z in glob.glob("/sys/class/thermal/thermal_zone*"):
+        t = rd(z + "/type", "")
+        if t.startswith(("cpu", "gpu")):
+            out.append(z + "/temp")
+    return out
+
+
+def nearest(avail, limit):
+    """Highest available frequency <= limit (frequencies as ints)."""
+    ok = [f for f in avail if f <= limit]
+    return max(ok) if ok else min(avail)
+
+
+def main():
+    temps = zones()
+    if not temps:
+        sys.exit("no CPU thermal zones")
+    hwmax = {k: int(rd(p + "/cpuinfo_max_freq")) for k, p in POL.items()}
+    avail = {k: sorted(int(x) for x in rd(p + "/scaling_available_frequencies").split())
+             for k, p in POL.items()}
+    gpu_avail = sorted(int(x) for x in (rd(GPU + "/available_frequencies", "") or "").split()) if GPU else []
+    gpu_hwmax = max(gpu_avail) if gpu_avail else None
+
+    def apply(level):
+        prime, big, gpu = (None, None, None) if level < 0 else STEPS[level][1:]
+        wr(POL["prime"] + "/scaling_max_freq", nearest(avail["prime"], prime) if prime else hwmax["prime"])
+        wr(POL["big"] + "/scaling_max_freq", nearest(avail["big"], big) if big else hwmax["big"])
+        if GPU and gpu_avail:
+            wr(GPU + "/max_freq", nearest(gpu_avail, gpu) if gpu else gpu_hwmax)
+
+    def restore(*_):
+        apply(-1)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, restore)
+    signal.signal(signal.SIGINT, restore)
+    level = -1
+    apply(level)
+    print(f"q706f-thermal: watching {len(temps)} zones; steps at "
+          + ", ".join(f"{s[0]} C" for s in STEPS), flush=True)
+    ema = None
+    below_since = None
+    while True:
+        raw = max(int(rd(p, "0")) for p in temps) / 1000.0
+        ema = raw if ema is None else ALPHA * raw + (1 - ALPHA) * ema
+        new = level
+        # Tighten at once on the raw temperature (no averaging delay).
+        while new + 1 < len(STEPS) and raw >= STEPS[new + 1][0]:
+            new += 1
+        # Relax only after the smoothed temperature stayed below the release point
+        # (step - HYST) continuously for RELAX_AFTER seconds.
+        if new == level and level >= 0 and ema < STEPS[level][0] - HYST:
+            if below_since is None:
+                below_since = time.monotonic()
+            elif time.monotonic() - below_since >= RELAX_AFTER:
+                new = level - 1
+        else:
+            below_since = None
+        t = raw
+        if new != level:
+            below_since = None
+            apply(new)
+            desc = "no limit" if new < 0 else f"step {STEPS[new][0]} C"
+            print(f"q706f-thermal: {t:.1f} C -> {desc}", flush=True)
+            level = new
+        time.sleep(PERIOD)
+
+
+if __name__ == "__main__":
+    main()

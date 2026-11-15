@@ -1,0 +1,152 @@
+#!/usr/bin/python3
+"""q706f-tablet-mode: expose SW_TABLET_MODE for the Lenovo Tab P12 Pro.
+
+There is no keyboard-detect GPIO on this tablet.  The pogo keyboard hangs off
+a host MCU (i2c-hid 17EF:6127, always present, as is the 04F3:31F3 touchpad
+interface).  The MCU announces keyboard attach/detach in a vendor input
+report (ID 6); byte 1 is a status bitmap (Lenovo downstream i2c-hid-core.c):
+    bit0 keyboard online, bit3 cradle, bit4-5 kbd state, bit6 touchpad
+    suspended, bit7 keyboard hall (folio closed)
+
+This daemon reads that report from hidraw and mirrors it into a uinput
+switch device, so that libinput/Mutter enter "touch mode" (auto-rotation,
+on-screen keyboard) when the keyboard is detached.
+
+Limitation of the running kernel: the MCU sends its status once right after
+the i2c-hid reset at probe time, and mainline i2c-hid drops reports until the
+device is opened, so the state at boot is unknown.  We start in tablet mode
+and switch to laptop mode on the first "online" status report *or* on the
+first key/touchpad report (which can only come from an attached keyboard).
+The kernel patch 0005 makes this daemon unnecessary.
+
+Manual override:  systemctl kill -s USR1 q706f-tablet-mode   -> tablet mode
+                  systemctl kill -s USR2 q706f-tablet-mode   -> laptop mode
+"""
+import fcntl
+import glob
+import os
+import select
+import signal
+import struct
+import sys
+import time
+
+KBD_ID = "0018:000017EF:00006127"
+TP_ID = "0018:000004F3:000031F3"
+STATUS_REPORT = 0x06
+STATE_FILE = "/run/q706f-tablet-mode"
+
+EV_SYN, EV_SW, SW_TABLET_MODE, BUS_VIRTUAL = 0, 5, 1, 6
+UI_SET_EVBIT, UI_SET_SWBIT = 0x40045564, 0x4004556D
+UI_DEV_SETUP, UI_DEV_CREATE, UI_DEV_DESTROY = 0x405C5503, 0x5501, 0x5502
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+class Switch:
+    def __init__(self):
+        self.fd = os.open("/dev/uinput", os.O_WRONLY)
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_SW)
+        fcntl.ioctl(self.fd, UI_SET_SWBIT, SW_TABLET_MODE)
+        name = b"q706f tablet mode switch"
+        setup = struct.pack("HHHH80sI", BUS_VIRTUAL, 0x17EF, 0x6127, 1, name, 0)
+        fcntl.ioctl(self.fd, UI_DEV_SETUP, setup)
+        fcntl.ioctl(self.fd, UI_DEV_CREATE)
+        self.state = None
+
+    def set(self, tablet, why):
+        tablet = bool(tablet)
+        if tablet == self.state:
+            return
+        self.state = tablet
+        for etype, code, value in ((EV_SW, SW_TABLET_MODE, int(tablet)), (EV_SYN, 0, 0)):
+            os.write(self.fd, struct.pack("qqHHi", 0, 0, etype, code, value))
+        log("%s mode (%s)" % ("tablet" if tablet else "laptop", why))
+        try:
+            with open(STATE_FILE, "w") as f:
+                f.write("tablet\n" if tablet else "laptop\n")
+        except OSError:
+            pass
+
+    def close(self):
+        try:
+            fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+        except OSError:
+            pass
+        os.close(self.fd)
+
+
+def find_hidraw(hid_id):
+    for uevent in glob.glob("/sys/class/hidraw/hidraw*/device/uevent"):
+        try:
+            with open(uevent) as f:
+                if "HID_ID=" + hid_id in f.read():
+                    return "/dev/" + uevent.split("/")[4]
+        except OSError:
+            pass
+    return None
+
+
+def open_devices():
+    """Return {fd: role}; keeping hidraw open also keeps i2c-hid delivering reports."""
+    fds = {}
+    for role, hid_id in (("kbd", KBD_ID), ("tp", TP_ID)):
+        path = find_hidraw(hid_id)
+        if not path:
+            continue
+        try:
+            fds[os.open(path, os.O_RDONLY | os.O_NONBLOCK)] = role
+        except OSError as e:
+            log("cannot open %s: %s" % (path, e))
+    return fds
+
+
+def main():
+    sw = Switch()
+    signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+    forced = []
+    signal.signal(signal.SIGUSR1, lambda *a: forced.append(True))
+    signal.signal(signal.SIGUSR2, lambda *a: forced.append(False))
+    try:
+        # Give udev/libinput time to pick the new device up before the first
+        # event, then publish the boot assumption (keyboard detached).
+        time.sleep(1.5)
+        sw.set(True, "startup default, keyboard state unknown until the MCU reports")
+        fds = {}
+        while True:
+            if "kbd" not in fds.values():
+                for fd in fds:
+                    os.close(fd)
+                fds = open_devices()
+            # Short timeout: also the poll interval for overrides and rescans.
+            ready, _, _ = select.select(list(fds), [], [], 2)
+            while forced:
+                sw.set(forced.pop(0), "manual override")
+            for fd in ready:
+                role = fds[fd]
+                try:
+                    data = os.read(fd, 256)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    data = b""
+                if not data:  # device went away (driver rebind); rescan
+                    os.close(fd)
+                    del fds[fd]
+                    if role == "kbd":
+                        time.sleep(1)
+                    continue
+                if role == "kbd" and data[0] == STATUS_REPORT and len(data) > 1:
+                    online = data[1] & 0x01
+                    sw.set(not online, "MCU status 0x%02x" % data[1])
+                elif sw.state:
+                    # Key, consumer-key or touchpad report: a keyboard is there.
+                    sw.set(False, "input report from the %s interface" % role)
+    finally:
+        sw.close()
+
+
+if __name__ == "__main__":
+    main()

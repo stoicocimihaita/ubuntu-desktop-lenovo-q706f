@@ -1,0 +1,14 @@
+[Unit]
+Description=Set the Bluetooth public address (q706f)
+# Must run before bluetoothd loads the bonds stored under the adapter address.
+# Also started by udev whenever hci0 is (re)registered
+# (/etc/udev/rules.d/82-q706f-bt-addr.rules), hence no RemainAfterExit.
+Before=bluetooth.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/q706f-bt-addr
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target

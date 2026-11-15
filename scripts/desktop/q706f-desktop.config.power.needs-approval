@@ -1,0 +1,29 @@
+# *** NOT MERGED: append to q706f-desktop.config only with owner approval ***
+#
+# Suspend (s2idle) power, 2026-11-13 analysis. On kernel #5 the SoC never reaches
+# its low-power modes: /sys/kernel/debug/qcom_stats/{cxsd,aosd,ddr} Count = 0 after
+# 5 suspends, 13 mAh in 304 s (~154 mA).
+#
+# 1. Give up waiting for consumers that will never probe and run sync_state() once
+#    deferred_probe_timeout (10 s after the last driver registration) has expired.
+#    Same effect as "fw_devlink.sync_state=timeout" on the command line. Pending today:
+#      qnoc-sm8250 163d000/1700000.interconnect  <- 1dfa000.crypto (no QCE driver)
+#      gcc-sm8250 100000 / sm8250-gpucc 3d90000   <- 3d6a000.gmu (never a bound driver)
+#    Until all interconnect providers are synced every node keeps an INT_MAX vote in
+#    the RPMh active AND sleep sets; until gcc is synced its boot-on GDSCs stay on.
+#    Risk: a device that relied on a boot-time bus/GDSC vote without describing it in
+#    DT loses it ~10 s after boot (watch dmesg for bus errors/SErrors, UFS, USB,
+#    display, Wi-Fi). Patch 0014 (disable the QCE node) fixes the interconnect half
+#    without this option; the GMU half has no other fix.
+CONFIG_FW_DEVLINK_SYNC_STATE_TIMEOUT=y
+
+# 2. Diagnostics only (no functional change): /sys/power/pm_debug_messages,
+#    pm_print_times, pm_wakeup_irq, pm_test, /sys/power/suspend_stats/*hw_sleep.
+CONFIG_PM_DEBUG=y
+CONFIG_PM_ADVANCED_DEBUG=y
+CONFIG_PM_SLEEP_DEBUG=y
+
+# 3. NOT recommended, listed as the alternative to patch 0014: build the QCE driver so
+#    crypto@1dfa000 probes. It registers hardware AES/SHA implementations that are
+#    slower than ARMv8-CE and adds a DMA (cryptobam) dependency in the crypto path.
+# CONFIG_CRYPTO_DEV_QCE=m

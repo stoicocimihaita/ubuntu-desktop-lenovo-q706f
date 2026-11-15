@@ -1,0 +1,16 @@
+#!/bin/sh
+# q706f: camera sensors sometimes fail their ID read at boot ("failed to find sensor: -5",
+# "Cannot read register 0!") when the CCI controller times out early in boot; they probe
+# fine a moment later. CAMSS only registers the cameras once all sensors are bound, so
+# reload every sensor driver whose device is not bound yet (once).
+for spec in 21-0036:ov13b10 22-002d:s5k5e9 23-0036:ov8856; do
+  mod=${spec#*:}
+  for dev in /sys/bus/i2c/devices/*; do
+    [ "$(cat $dev/name 2>/dev/null)" = "$mod" ] || continue
+    [ -e "$dev/driver" ] && continue
+    echo "$mod ($(basename $dev)) not bound: reloading the driver"
+    modprobe -r "$mod" 2>/dev/null; sleep 1; modprobe "$mod"; sleep 1
+    [ -e "$dev/driver" ] && echo "$mod bound after reload" || echo "$mod still not bound"
+  done
+done
+exit 0

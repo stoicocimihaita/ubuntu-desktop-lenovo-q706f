@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Remote PC
+Name[ro]=Desktop PC
+Comment=Open the PC desktop on the tablet (RDP)
+Comment[ro]=Deschide desktopul PC-ului pe tabletă (RDP)
+Exec=/usr/local/bin/q706f-remote-pc
+Icon=preferences-desktop-remote-desktop
+Terminal=false
+Categories=Network;RemoteAccess;

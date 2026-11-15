@@ -1,0 +1,31 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] arm64: dts: qcom: sm8250-lenovo-q706f: bring back the AS33970 capture link
+
+Needs 0011 (driver registers its DAI without firmware and never downloads on
+its own). Re-enables the DSP node and the "SENARY Capture" DAI link that 0002
+removed. Without a firmware download the link exists but cannot be opened;
+the regular microphones (WCD938x, "WCD Capture") do not depend on it.
+
+Apply only together with the owner's decision to load the DSP firmware.
+---
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts	2026-11-13 13:17:15.658998270 +0200
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts	2026-11-13 13:18:53.684632282 +0200
+@@ -2143,18 +2143,3 @@
+ 	firmware-name = "qcom/sm8250/q706f/venus.mbn";
+ 	status = "okay";
+ };
+-
+-/*
+- * Bring-up: the AS33970 microphone DSP does not answer on this unit and its
+- * driver would rewrite the DSP flash. Keep it off and drop its capture link so
+- * the sound card (speakers) can register.
+- */
+-&as33970 {
+-	status = "disabled";
+-};
+-
+-&sound {
+-	pinctrl-0 = <&pri_tdm_active>;
+-
+-	/delete-node/ senary-capture-dai-link;
+-};

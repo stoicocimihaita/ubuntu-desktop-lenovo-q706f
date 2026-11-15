@@ -1,0 +1,12 @@
+[Unit]
+Description=Retry the front camera sensor probe (q706f)
+After=systemd-modules-load.service systemd-udev-settle.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/local/libexec/q706f-camera-retry
+
+[Install]
+WantedBy=multi-user.target

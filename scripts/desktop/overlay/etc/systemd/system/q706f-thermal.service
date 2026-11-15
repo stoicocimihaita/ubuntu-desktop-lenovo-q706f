@@ -1,0 +1,10 @@
+[Unit]
+Description=Temperature-based CPU/GPU frequency limits from 70 C (q706f)
+
+[Service]
+ExecStart=/usr/local/sbin/q706f-thermal
+Restart=on-failure
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

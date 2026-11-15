@@ -1,0 +1,67 @@
+# Lenovo Tab P12 Pro (q706f) defaults. Run glib-compile-schemas after install.
+# Sections are given twice where Ubuntu ships a session-specific (":ubuntu")
+# default, otherwise the Ubuntu session would ignore ours.
+
+# Power: tablet behaviour.
+# - no automatic suspend: wake-up from s2idle is not validated yet (the single
+#   switch for real suspend is /etc/systemd/sleep.conf.d/10-q706f-suspend.conf)
+# - the power button is handled by q706f-screen-keys (screen off / on), so
+#   GNOME must do nothing with it. NOTE: do not set the chassis type to
+#   "tablet": gsd-media-keys then hardcodes "suspend" and ignores this key.
+# - no ambient-light auto brightness: rapid brightness changes are known to
+#   upset this panel (DSI command errors)
+[org.gnome.settings-daemon.plugins.power]
+sleep-inactive-ac-type='nothing'
+sleep-inactive-battery-type='nothing'
+ambient-enabled=false
+power-button-action='nothing'
+
+[org.gnome.settings-daemon.plugins.power:ubuntu]
+sleep-inactive-ac-type='nothing'
+sleep-inactive-battery-type='nothing'
+ambient-enabled=false
+power-button-action='nothing'
+
+# Screen blanks after 5 minutes without input; no password on wake-up
+# (single-user tablet with autologin; turn lock-enabled on in
+# Settings > Privacy & Security > Screen Lock if wanted).
+[org.gnome.desktop.session]
+idle-delay=uint32 300
+
+[org.gnome.desktop.session:ubuntu]
+idle-delay=uint32 300
+
+[org.gnome.desktop.screensaver]
+lock-enabled=false
+ubuntu-lock-on-suspend=false
+
+[org.gnome.desktop.screensaver:ubuntu]
+lock-enabled=false
+ubuntu-lock-on-suspend=false
+
+# On-screen keyboard: GNOME's built-in one, shown automatically in touch mode
+# (SW_TABLET_MODE on, i.e. keyboard detached). Not forced via accessibility.
+[org.gnome.desktop.a11y.applications]
+screen-keyboard-enabled=false
+
+[org.gnome.desktop.interface]
+show-battery-percentage=true
+
+# Dock: only installed apps; slightly larger icons for fingers
+# (56 logical px at scale 1.667 = ~10 mm on this panel).
+# Extensions: the panel button for the on-screen keyboard (osk-button@q706f, shipped in
+# /usr/share/gnome-shell/extensions). The Ubuntu session adds its own extensions through
+# the session mode, so only ours is listed.
+[org.gnome.shell]
+favorite-apps=['org.gnome.Epiphany.desktop', 'org.gnome.Nautilus.desktop', 'com.github.xournalpp.xournalpp.desktop', 'org.gnome.Terminal.desktop', 'org.gnome.Settings.desktop', 'q706f-remote-pc.desktop']
+enabled-extensions=['osk-button@q706f']
+
+[org.gnome.shell:ubuntu]
+favorite-apps=['org.gnome.Epiphany.desktop', 'org.gnome.Nautilus.desktop', 'com.github.xournalpp.xournalpp.desktop', 'org.gnome.Terminal.desktop', 'org.gnome.Settings.desktop', 'q706f-remote-pc.desktop']
+enabled-extensions=['osk-button@q706f']
+
+[org.gnome.shell.extensions.dash-to-dock]
+dash-max-icon-size=56
+
+[org.gnome.shell.extensions.dash-to-dock:ubuntu]
+dash-max-icon-size=56

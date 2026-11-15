@@ -1,0 +1,14 @@
+# Lenovo Tab P12 Pro (q706f): sensors behind the SLPI, exposed to
+# iio-sensor-proxy (>= 3.9, built with libssc) via /dev/fastrpc-sdsp.
+
+ACTION=="remove", GOTO="q706f_ssc_end"
+
+# Accelerometer mount matrix (same as postmarketOS device-lenovo-q706f)
+SUBSYSTEM=="misc", KERNEL=="fastrpc-*", ENV{ACCEL_MOUNT_MATRIX}+="0, 1, 0; -1, 0, 0; 0, 0, -1"
+
+# Sensor types. The Ubuntu 80-iio-sensor-proxy.rules (3.8) has no SSC entries
+# and upstream 3.9 leaves ssc-accel off by default (libssc issue 98); the
+# accelerometer is verified working on this tablet, so enable it here.
+SUBSYSTEM=="misc", KERNEL=="fastrpc-sdsp", ENV{IIO_SENSOR_PROXY_TYPE}+="ssc-accel ssc-light ssc-compass", TAG+="systemd", ENV{SYSTEMD_WANTS}+="iio-sensor-proxy.service"
+
+LABEL="q706f_ssc_end"

@@ -1,0 +1,35 @@
+# q706f (Lenovo Tab P12 Pro): packages that must never be installed on this tablet.
+# Pin-Priority -1 makes apt refuse them, also as dependencies or recommendations.
+# Installed by the image (scripts/desktop/overlay) and by q706f-secure.sh --apt-pins.
+# Checked by scripts/desktop/check-rootimg.sh. To see the effect: apt-cache policy <pkg>.
+#
+# Nothing in the image depends on these packages (checked against the package list of
+# scripts/desktop/build-rootfs.sh). linux-firmware*, linux-sound-base, linux-libc-dev,
+# linux-tools-* and initramfs-tools are NOT pinned: they do not install a kernel and do
+# not write to any partition.
+
+# Rewrite the A/B slot flags in the misc/boot partitions or reboot the tablet
+# (pulled as Recommends of hexagonrpcd).
+Explanation: q706f: writes A/B slot flags / reboots the tablet
+Package: qbootctl droid-juicer qcom-phone-utils
+Pin: version *
+Pin-Priority: -1
+
+Explanation: q706f: writes boot images or firmware without the owner's approval
+Package: flash-kernel fwupd fwupd-signed
+Pin: version *
+Pin-Priority: -1
+
+# The kernel is built from scripts/desktop and written to boot_a by hand, with the
+# owner's approval. An Ubuntu kernel (meta)package would only add a second, unbootable
+# kernel plus /etc/kernel/postinst.d hooks that try to manage it.
+Explanation: q706f: the kernel does not come from the Ubuntu archive
+Package: linux-image-* linux-generic* linux-modules-* linux-signed-* linux-virtual* linux-lowlatency* linux-oem-* linux-raspi* linux-kvm* linux-qcom* linux-headers-generic*
+Pin: version *
+Pin-Priority: -1
+
+# No UEFI and no GRUB on this tablet: the Lenovo ABL boots boot_a directly.
+Explanation: q706f: no UEFI bootloader on this tablet
+Package: grub-* grub2-* shim shim-signed systemd-boot systemd-boot-efi nullboot u-boot-menu
+Pin: version *
+Pin-Priority: -1
