@@ -1,0 +1,8 @@
+#!/bin/sh
+# Problem B fix test (fresh boot): WIFI_UNLOAD_IN_SLEEP=1 in the sleep hook, four normal 60 s suspends.
+L=/var/log/q706f-wifitest.log; Q=/sys/kernel/debug/qcom_stats
+st(){ echo "  $(date +%T) $1 cxsd=$(awk "/Count/{print \$2}" $Q/cxsd) aosd=$(awk "/Count/{print \$2}" $Q/aosd) adsp=$(awk "/Count/{print \$2}" $Q/adsp) ath11k=$(lsmod | grep -c "^ath11k_pci ")"; }
+sleep 60
+{ echo "== $(date) Wi-Fi driver unloaded in sleep"; st start
+for n in 1 2 3 4; do rtcwake -m no -s 60 >/dev/null; systemctl suspend; sleep 30; st suspend$n; done
+echo "wifi: $(nmcli -t -f DEVICE,STATE dev | grep ^wlp1s0)"; echo done; } >> $L 2>&1

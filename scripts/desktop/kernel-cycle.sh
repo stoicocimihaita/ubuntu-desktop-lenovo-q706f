@@ -44,6 +44,14 @@ do_build() {
 do_push() {
   say "push modules to $TABLET"
   R=$(ls "$ROOT/out/desktop/kernel/modules/lib/modules" | head -1)
+  # The release is always the bare version, so these modules replace those of the kernel
+  # on boot_a. Refuse when the source tree carries changes beyond the series (debug patch
+  # applied by hand after the stamp was written).
+  SRC="$ROOT/sources/linux-desktop"
+  if [ -z "${ALLOW_NONSERIES_PUSH:-}" ] && find "$SRC" -newer "$SRC/.rev" -type f \( -name '*.[ch]' -o -name '*.dts*' \) -print -quit | grep -q .; then
+    echo "source tree differs from the patch series (files newer than .rev): not pushing over /usr/lib/modules/$R."
+    echo "Rebuild the series (rm $SRC/.rev; kernel-cycle.sh build) or set ALLOW_NONSERIES_PUSH=1."; exit 1
+  fi
   tar -C "$ROOT/out/desktop/kernel/modules/lib/modules" -cf - "$R" | ssh "$TABLET" "sudo sh -ec '
     rm -rf /usr/lib/modules/$R.new; mkdir -p /usr/lib/modules/$R.new
     tar -C /usr/lib/modules/$R.new -xf - --strip-components=1 -m
@@ -58,8 +66,13 @@ do_ramboot() {
   say "reboot tablet to bootloader"
   # End a pen wireless-charging session cleanly first (an interrupted one corrupts the pen's NFC tag).
   ssh "$TABLET" 'sudo sh -c "[ -e /sys/class/misc/ctn730/enable ] && echo 0 > /sys/class/misc/ctn730/enable; sleep 2; sync; (sleep 1; systemctl reboot --reboot-argument=bootloader) >/dev/null 2>&1 &"' || true
-  until fastboot devices | grep -q fastboot; do sleep 3; done
-  [ -n "$SERIAL" ] || SERIAL=$(fastboot devices | awk 'NR==1{print $1}')
+  n=0; until fastboot devices | grep -q fastboot; do
+    sleep 3; n=$((n+1)); [ $n -lt 60 ] || { echo "no fastboot device after 3 min"; exit 1; }
+  done
+  if [ -z "$SERIAL" ]; then
+    [ "$(fastboot devices | grep -c fastboot)" = 1 ] || { echo "more than one fastboot device: set SERIAL"; exit 1; }
+    SERIAL=$(fastboot devices | awk 'NR==1{print $1}')
+  fi
   sleep 6
   # After entering from Linux the ABL is only half initialised: always restart it once.
   fb reboot bootloader >/dev/null 2>&1 || true
@@ -71,6 +84,7 @@ do_ramboot() {
     fb getvar max-download-size 2>&1 | grep -q 805306368 && fb getvar current-slot 2>&1 | grep -q 'current-slot: a' \
       || { echo "bootloader not ready (fastboot reboot bootloader again, or 'Restart bootloader' on the tablet)"; exit 1; }
   done
+  fb getvar product 2>&1 | grep -q 'product: kona' || { echo "fastboot device is not the q706f (product != kona)"; exit 1; }
   say "slot $(fb getvar current-slot 2>&1 | head -1)"
   T=60 fb boot "$IMG" 2>&1 | tail -1
   say "waiting for the tablet (USB network)"
@@ -102,5 +116,5 @@ cat <<EOF
 == not done by this script (needs the owner's explicit OK each time):
    fastboot ${SERIAL:+-s $SERIAL }reboot bootloader   # from a session entered from Linux
    fastboot ${SERIAL:+-s $SERIAL }flash boot_a $IMG
-   rollback: fastboot flash boot_a $ROOT/out/desktop/ubuntu-boot-7.1.img   # last 7.1 image; its modules are still on the tablet
+   rollback: fastboot flash boot_a $ROOT/out/desktop/ubuntu-boot-power-B3af.img   # B3af (7.3.4-power), its modules stay on the tablet
 EOF

@@ -17,7 +17,7 @@ the i2c-hid reset at probe time, and mainline i2c-hid drops reports until the
 device is opened, so the state at boot is unknown.  We start in tablet mode
 and switch to laptop mode on the first "online" status report *or* on the
 first key/touchpad report (which can only come from an attached keyboard).
-The kernel patch 0005 makes this daemon unnecessary.
+The kernel patch 0105 makes this daemon unnecessary.
 
 Manual override:  systemctl kill -s USR1 q706f-tablet-mode   -> tablet mode
                   systemctl kill -s USR2 q706f-tablet-mode   -> laptop mode

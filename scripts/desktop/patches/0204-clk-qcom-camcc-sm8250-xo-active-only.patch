@@ -9,7 +9,7 @@ for the same always-on path.
 
 Status: tested on q706f 14.11.2026 as a module on 7.3.4 - cameras still
 enumerate, the parent becomes bi_tcxo_ao; alone it does not bring
-cxsd/aosd/ddr above 0 (other blockers remain). Not applied yet.
+cxsd/aosd/ddr above 0 (other blockers remain). In the series.
 ---
 --- a/drivers/clk/qcom/camcc-sm8250.c
 +++ b/drivers/clk/qcom/camcc-sm8250.c

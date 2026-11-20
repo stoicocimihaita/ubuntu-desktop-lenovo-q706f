@@ -1,0 +1,66 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] ASoC: cs35l45: do not wake the DSP before it has entered hibernation
+
+cs35l45_enter_hibernate() sends HIBERNATE without waiting for an
+acknowledgement (bus activity would wake the part). When a stream starts
+within tens of milliseconds after runtime suspend, OUT_OF_HIBERNATE is
+reported successful at once, the firmware then finishes hibernating and
+about 200 ms later all amplifiers raise "DSP Watchdog Timer"; the
+protection algorithm stays dead (heartbeat frozen, RESUME rejected) until
+the firmware is reloaded. On q706f PipeWire probing at session start hits
+this window on every boot.
+
+Keep the part in hibernation for at least 100 ms before waking it.
+---
+diff -ru a/sound/soc/codecs/cs35l45.c b/sound/soc/codecs/cs35l45.c
+--- a/sound/soc/codecs/cs35l45.c	2026-11-20 09:39:39.376986213 +0200
++++ b/sound/soc/codecs/cs35l45.c	2026-11-20 09:39:39.387639164 +0200
+@@ -951,6 +951,9 @@
+ 			   CS35L45_UPDT_WKI2C_MASK);
+ }
+ 
++/* Minimum time between HIBERNATE and OUT_OF_HIBERNATE */
++#define CS35L45_HIBERNATE_MIN_MS	100
++
+ static int cs35l45_enter_hibernate(struct cs35l45_private *cs35l45)
+ {
+ 	dev_dbg(cs35l45->dev, "Enter hibernate\n");
+@@ -961,6 +964,7 @@
+ 
+ 	// Don't wait for ACK since bus activity would wake the device
+ 	regmap_write(cs35l45->regmap, CS35L45_DSP_VIRT1_MBOX_1, CSPL_MBOX_CMD_HIBERNATE);
++	cs35l45->hibernate_start = ktime_get();
+ 
+ 	return 0;
+ }
+@@ -969,8 +973,19 @@
+ {
+ 	const int wake_retries = 20;
+ 	const int sleep_retries = 5;
++	s64 since_ms;
+ 	int ret, i, j;
+ 
++	/*
++	 * HIBERNATE is not acknowledged. Waking the firmware before it has
++	 * finished entering hibernation makes OUT_OF_HIBERNATE look successful
++	 * at once, the firmware then completes the hibernation and its watchdog
++	 * fires; the protection algorithm is dead until the DSP is reloaded.
++	 */
++	since_ms = ktime_ms_delta(ktime_get(), cs35l45->hibernate_start);
++	if (since_ms >= 0 && since_ms < CS35L45_HIBERNATE_MIN_MS)
++		msleep(CS35L45_HIBERNATE_MIN_MS - since_ms);
++
+ 	for (i = 0; i < sleep_retries; i++) {
+ 		dev_dbg(cs35l45->dev, "Exit hibernate\n");
+ 
+diff -ru a/sound/soc/codecs/cs35l45.h b/sound/soc/codecs/cs35l45.h
+--- a/sound/soc/codecs/cs35l45.h	2026-11-20 09:39:39.377248931 +0200
++++ b/sound/soc/codecs/cs35l45.h	2026-11-20 09:39:39.387371656 +0200
+@@ -505,6 +505,7 @@
+ 	unsigned int i2c_addr;
+ 	enum control_bus_type bus_type;
+ 	struct regmap_irq_chip_data *irq_data;
++	ktime_t hibernate_start;
+ };
+ 
+ extern const struct dev_pm_ops cs35l45_pm_ops;

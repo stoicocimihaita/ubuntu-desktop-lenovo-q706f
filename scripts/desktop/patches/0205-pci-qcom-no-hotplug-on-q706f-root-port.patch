@@ -9,7 +9,7 @@ dw_pcie_suspend_noirq() then sees pci_host_common_d3cold_possible() == false,
 keeps the link in L0/L1 and the controller clocks (aux, refgen <- GPLL0/CXO)
 stay on, holding a CXO vote: no SoC deep sleep (cxsd/aosd/ddr stay 0).
 
-Status: under test (14.11.2026). Not applied to the series yet.
+Status: in the series (B3af and later).
 ---
 --- a/drivers/pci/controller/dwc/pcie-qcom.c
 +++ b/drivers/pci/controller/dwc/pcie-qcom.c

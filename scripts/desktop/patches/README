@@ -9,7 +9,7 @@ sha256:  b11b6df8295e8e991ff040b71aaa4994a8b55caa23b6b092907f195b5840fd1f
 
 The patches apply in file-name order with `patch -p1 -F0` (no fuzz, no offsets needed)
 on a pristine extraction of the tarball. The result is byte-for-byte identical to
-sources/linux-desktop-7.3.4 (verified with `diff -r` on a fresh extraction).
+sources/linux-desktop (verified with `diff -r` on a fresh extraction).
 
 Patches
 -------
@@ -45,15 +45,13 @@ Patches
     0106 panel amsa26zp01 60 Hz
     The *.needs-approval patches of the project are not part of the series.
 
-Not applied: *.pending and *.needs-approval
--------------------------------------------
-build-kernel.sh only applies *.patch. Files ending in .pending (0112-0115, 0203a-e,
-0204-0206) are prepared patches that are not yet integrated into the series. The kernel
-the author runs on the tablet (7.3.4 "B3af") is this series plus 0113, 0114, 0203a-e,
-0204, 0205, 0206 and the two proposals 0014/0015; 0112 and 0115 are untested. Files
-ending in .needs-approval (0008, 0011b, 0012, 0014, 0015) are proposals only: some of
-them touch persistent state (PMIC SDAM) or have not been validated. Read the header of
-each before renaming it to .patch.
+0014, 0015  (DTS, integrated 16.11.2026; previously *.needs-approval, proven in B2/B3af)
+    0014 disables the unused QCE (crypto engine) node, 0015 the unused PCIe2 controller.
+
+0113, 0114  (integrated 16.11.2026; proven in B3af on both slots since 14.11.2026)
+    0113 goodix-berlin: send the pen on/off command (0x14/0x15 at 0x10174), sysfs pen_mode;
+         without it the GT9916 never reports the pen after a power cycle.
+    0114 DTS: rear camera DW9768 lens actuator at 0x0c on CCI0 (manual focus).
 
 0201-backport-ufs-qcom-enable-only-lane-clocks.patch
     Upstream commit f07317a8d57f (v7.4-rc1). Replaces the project's pending
@@ -65,6 +63,30 @@ each before renaming it to .patch.
     RPMh CX. Works with the v7.3.4 gdsc code (gdsc_register() parents the GDSCs to the
     provider's power domain); the 7.4 driver clean-up 361b375a4bb1 is not required.
     Drop this patch first if a GDSC consumer misbehaves.
+
+0203a ... 0203e  (integrated 16.11.2026; proven in B2/B3af)
+    Adreno GMU / drm-msm series (Akhil P Oommen): CX power-domain link, standalone GPU
+    component, GMU driver attach; fixes the GPU suspend/resume path.
+
+0204-clk-qcom-camcc-sm8250-xo-active-only.patch   camcc parent = XO active-only
+0205-pci-qcom-no-hotplug-on-q706f-root-port.patch  PCIe root port without hot-plug, so
+    the Wi-Fi link goes to L2 and the host is deinitialised in s2idle
+0206-arm64-dts-qcom-sm8250-cpu-icc-active-only.patch  CPU-DDR ICC paths ACTIVE_ONLY
+    (also carried by other SM8250 projects as "1118")
+    (0204-0206 integrated 16.11.2026; proven in B3af)
+
+0118-asoc-qcom-sm8250-release-afe-port-clocks-on-shutdown.patch  backend shutdown sends a
+    0 Hz request (enable = 0) for the MI2S/TDM bit clock enabled in startup(); without it
+    the LPASS clock stays voted in the ADSP and the SoC never reaches CXSD (integrated
+    16.11.2026; RAM-boot test r13: first CXSD with the full system)
+
+Without 0118, with 0014, 0015, 0113, 0114 and 0203a-0206 the series reproduces, source for source, the
+B3af kernel that runs on boot_a/boot_b since 14.11.2026 (verified 16.11.2026 with
+diff -r against the B3af source tree).
+
+Still pending (not applied by the build): 0112 (soundwire, not needed), 0115 (panel
+probe-time supply vote, untested), 0116 (USB-PD 9 V sink PDO + 4 A charging, 9 V not
+tested yet), 0117 (pm8150b Quick Charge 9 V request, QC path not exercised yet).
 
 Evaluated and not applied
 -------------------------
@@ -102,3 +124,23 @@ Not applied
 *.needs-approval files in this directory are proposals waiting for the owner's decision
 (they still apply cleanly on this tree). The former 7.1 series is kept for reference in
 ../patches-7.1/ (0013 there is superseded by 0201 here).
+
+0121-wifi-ath11k-pci-unbind-across-system-suspend.patch  (integrated 20.11.2026)
+    Module parameter ath11k_pci.unbind_in_suspend (default off; on in
+    /etc/modprobe.d/q706f-ath11k.conf): the PCI device is unbound at PM_SUSPEND_PREPARE and
+    bound again after resume. With the driver bound, only the first s2idle after boot
+    reaches CX collapse; with it, CXSD on every suspend (overnight ~52 mA vs ~97 mA).
+
+0123-asoc-cs35l45-tempmon-override-and-irq-names.patch  (integrated 20.11.2026)
+    TEMPMON global override around the speaker-protection firmware (as the vendor driver
+    does) and correct names for the amplifier error interrupts. The protection firmware
+    itself still does not process audio on mainline; speakers stay on the bypass route
+    with the UCM volume cap.
+
+Other files:
+    0119 *.rejected   AS33970 supplies not always-on (rejected: the sound card no longer probes)
+    0120 *.pending    q6dsp-lpass-clocks: drvdata before clock registration (ADSP restart crash)
+    0121b *.pending   debug-only ath11k experiment (firmware boot in resume instead of resume_early)
+    0122 *.pending    s5k5e9: propagate I2C errors, start at 1x gain (optional)
+    0124 *.pending    cs35l45: minimum time in hibernation before wake (no effect alone)
+    0899 *.debug      debug-only (PCIe controller kept off)

@@ -1,0 +1,5 @@
+# Runtime PM for the USB controller and PHYs (power-audit 17.11.2026, item 1): with nothing
+# attached they stayed powered (power/control=on). dwc3 resumes on a role switch / cable.
+ACTION=="add", SUBSYSTEM=="platform", KERNEL=="a6f8800.usb|a600000.usb|88e3000.phy|88e8000.phy", ATTR{power/control}="auto"
+# QCA6390 PCIe endpoint (item 2): allow runtime PM where the driver supports it.
+ACTION=="add", SUBSYSTEM=="pci", KERNEL=="0000:01:00.0", ATTR{power/control}="auto"

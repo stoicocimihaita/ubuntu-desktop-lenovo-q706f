@@ -1,0 +1,9 @@
+#!/bin/sh
+# Same format every time (S16_LE 48 kHz, 1 s of silence), gaps around the 3 s autosuspend delay.
+alsaucm -c hw:0 set _verb HiFi set _enadev Speaker >/dev/null 2>&1
+for gap in 1 2 2.8 2.95 3.0 3.05 3.1 3.2 3.5 4 6; do
+  timeout 5 aplay -q -D hw:0,0 -f S16_LE -r 48000 -c 2 -d 1 /dev/zero
+  sleep $gap
+  echo "gap $gap: up=$(cut -d' ' -f1 /proc/uptime) watchdogs=$(journalctl -k -b -o cat | grep -c 'DSP Watchdog')"
+done
+alsaucm -c hw:0 set _verb HiFi set _disdev Speaker >/dev/null 2>&1

@@ -1,5 +1,7 @@
 # DE-FACUT.md — ce rămâne de făcut pentru Ubuntu 26.04 Desktop pe q706f (kernel 7.3.4)
 
+> **Notă 20.11.2026:** documentul nu a mai fost actualizat după 13.11.2026. Starea curentă e în `README.md` și `docs/STATUS-UBUNTU.md`.
+
 Stare la **13.11.2026**. Starea componentelor: `docs/STATUS-UBUNTU.md`. Istoricul testelor: jurnalul de lucru (nepublicat).
 Regulile de siguranță citate în tabele: **R1** scrieri pe partiții, **R2** întâi din RAM,
 **R4** scrieri persistente în cipuri, **R5** suspendare doar cu proprietarul lângă tabletă, **R6** `apt` doar cu

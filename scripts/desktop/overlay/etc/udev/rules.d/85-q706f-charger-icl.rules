@@ -1,0 +1,3 @@
+# Raise the 1.5 A input limit of proprietary 5 V chargers to 2 A (see q706f-charger-icl).
+# The charger driver settles APSD a moment after plug-in, so run delayed.
+SUBSYSTEM=="power_supply", KERNEL=="pm8150b-charger", ACTION=="change", RUN+="/usr/bin/systemd-run --no-block --on-active=3 --timer-property=AccuracySec=100ms /usr/local/libexec/q706f-charger-icl"

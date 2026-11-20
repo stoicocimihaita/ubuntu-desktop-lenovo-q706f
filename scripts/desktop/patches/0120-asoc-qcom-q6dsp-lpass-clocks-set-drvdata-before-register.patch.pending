@@ -1,0 +1,45 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] ASoC: qcom: q6dsp-lpass-clocks: set drvdata before registering the clocks
+
+q6dsp_clock_dev_probe() registers the clocks and the clock provider and only
+then sets the drvdata that clk_q6dsp_prepare() and the vote ops use to find the
+controller. When the ADSP restarts, the AFE clock device is re-created and a
+consumer that was waiting for the provider (LPASS LPI pinctrl, codec macros)
+prepares a clock as soon as the provider appears:
+
+  Unable to handle kernel NULL pointer dereference at virtual address 0000000000000350
+  pc : clk_q6dsp_prepare+0x2c/0x50
+
+Set the drvdata before registering anything.
+---
+--- a/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c	2026-11-18 18:17:54.508629814 +0200
++++ b/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c	2026-11-18 18:17:54.513809937 +0200
+@@ -146,6 +146,14 @@
+ 	cc->dev = dev;
+ 	q6dsp_clks = desc->clks;
+ 
++	/*
++	 * The clock ops look the controller up through the device's drvdata.
++	 * Set it before registering the clocks: once the provider is added, a
++	 * consumer that was waiting for it (for example after an ADSP restart)
++	 * may prepare a clock right away.
++	 */
++	dev_set_drvdata(dev, cc);
++
+ 	for (i = 0; i < desc->num_clks; i++) {
+ 		unsigned int id = q6dsp_clks[i].clk_id;
+ 		struct clk_init_data init = {
+@@ -174,12 +182,6 @@
+ 			return ret;
+ 	}
+ 
+-	ret = devm_of_clk_add_hw_provider(dev, q6dsp_of_clk_hw_get, cc);
+-	if (ret)
+-		return ret;
+-
+-	dev_set_drvdata(dev, cc);
+-
+-	return 0;
++	return devm_of_clk_add_hw_provider(dev, q6dsp_of_clk_hw_get, cc);
+ }
+ EXPORT_SYMBOL_GPL(q6dsp_clock_dev_probe);

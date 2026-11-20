@@ -9,6 +9,14 @@ pipeline-ului „simple” lucrează cu codurile brute de amplificare și pozele
 | `0001-libipa-add-ov13b10-ov8856-s5k5e9-sensor-helpers.patch` | modelele de amplificare (și nivelul de negru pentru ov8856); antetul explică valorile și sursa lor |
 | `build-libcamera.sh` | reconstruiește tot pachetul sursă Ubuntu (arm64, container `ubuntu:26.04` prin qemu) cu patch-urile `NNNN-*.patch`; rezultat în `out/desktop/libcamera/debs/`, versiunea `0.7.0-1ubuntu2+q706f1` |
 | `camtest.sh` | test pe tabletă: 60 de cadre per cameră, ultimul AnalogueGain/ExposureTime, luminozitatea medie, JPEG mic |
+| `blacklevel.sh` | nivelul de negru din cadre RAW cu obiectivul acoperit (medie/mediană pe 10 biți → valoarea pe 16 biți pentru tuning) |
+| `build-libcamera-upstream.sh` + `upstream/add-sensor-helpers.py` | libcamera din git (commit fixat, cu seria VBLANK) construit în container, arhivă doar cu `/usr/local` (`cam-upstream`); nu atinge pachetele 0.7 |
+| `fdl-33-66ms.yaml` | script `cam --script`: FrameDurationLimits 33–66 ms |
+| `tuning/ov13b10-txd.yaml` | varianta TXD a fișierului de tuning ov13b10 (implicit în overlay: OFilm) |
+| `tools/chromatix-ccm.py` | extrage matricele CCM (cc13) din `com.qti.tuned.*.bin` stock (fișierele stock rămân în `out/`) |
+
+Fișierele de tuning instalabile: `scripts/desktop/overlay/usr/share/libcamera/ipa/simple/{ov13b10,ov8856,s5k5e9}.yaml`.
+Planul complet: `docs/PLAN-CAMERE-2026-11-20.md`.
 
 Se reconstruiește tot pachetul (nu doar `ipa_soft_simple.so`) pentru că modulele IPA sunt semnate cu o
 cheie generată la build și verificată de `libcamera.so`; dacă semnăturile nu se potrivesc, IPA rulează izolat.

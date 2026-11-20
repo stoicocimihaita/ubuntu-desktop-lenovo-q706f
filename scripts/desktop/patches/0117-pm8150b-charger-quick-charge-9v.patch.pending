@@ -1,0 +1,111 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] power: supply: pm8150b: request 9 V from Quick Charge adapters
+
+Enable the PMIC HVDCP detection/authentication (not the autonomous mode)
+and, when APSD reports a QC 2.0/3.0 adapter and there is no PD contract,
+ask it for 9 V with CMD_HVDCP_2 FORCE_9V and allow 2 A of input. The PMIC
+returns to 5 V on removal. Module parameter hvdcp=0 turns it off.
+
+--- a/drivers/power/supply/qcom_pm8150b_charger.c
++++ b/drivers/power/supply/qcom_pm8150b_charger.c
+@@ -145,6 +145,9 @@
+ #define APSD_RERUN_BIT				BIT(0)
+ 
+ #define CMD_ICL_OVERRIDE			0x342
++#define CMD_HVDCP_2				0x343
++#define FORCE_9V_BIT				BIT(4)
++#define FORCE_5V_BIT				BIT(3)
+ #define ICL_OVERRIDE_BIT			BIT(0)
+ 
+ #define TYPE_C_CFG				0x358
+@@ -275,6 +278,9 @@
+ #define TYPEC_MEDIUM_CURRENT_UA		1500000
+ #define TYPEC_HIGH_CURRENT_UA		3000000
+ #define CURRENT_MAX_UA			3000000
++/* Quick Charge 2.0/3.0 adapter after a 9 V request: 9 V 2 A is the common rating */
++#define QC_9V_CURRENT_UA		2000000
++#define QC_DETECT_POLLS			6
+ 
+ /* pm8150b registers represent current in increments of 1/20th of an amp */
+ #define CURRENT_SCALE_FACTOR		50000
+@@ -330,6 +336,15 @@
+ #define THERMAL_READ_RETRIES		3
+ /* clang-format on */
+ 
++/*
++ * Quick Charge (HVDCP): the PMIC detects QC 2.0/3.0 adapters behind a BC1.2
++ * DCP and, on request, asks them for 9 V. Stock enables this only when no PD
++ * contract exists, which is also the only path where it is used here.
++ */
++static bool hvdcp = true;
++module_param(hvdcp, bool, 0444);
++MODULE_PARM_DESC(hvdcp, "Detect Quick Charge adapters and request 9 V (default: Y)");
++
+ /* BATTERY_CHARGER_STATUS_1 on PM8150B (vendor smb5-reg.h), not PMI8998 */
+ enum charger_status {
+ 	INHIBIT_CHARGE = 0,
+@@ -406,6 +421,8 @@
+ 	struct power_supply_battery_info *batt_info;
+ 
+ 	struct delayed_work status_change_work;
++	bool qc_forced;
++	unsigned int qc_polls;
+ 	int cable_irq;
+ 	bool wakeup_enabled;
+ 
+@@ -809,6 +826,9 @@
+ 	if (!usb_online) {
+ 		/* The next source starts from the lowest limit */
+ 		smb5_set_current_limit(chip, SDP_CURRENT_UA);
++		/* The PMIC drops the adapter back to 5 V on removal */
++		chip->qc_forced = false;
++		chip->qc_polls = 0;
+ 		return;
+ 	}
+ 
+@@ -852,6 +872,28 @@
+ 
+ 	current_ua = smb5_apsd_to_current(apsd_result);
+ 
++	if (hvdcp && (apsd_result & (QC_2P0_BIT | QC_3P0_BIT))) {
++		if (!chip->qc_forced) {
++			rc = regmap_write(chip->regmap, chip->base + CMD_HVDCP_2,
++					  FORCE_9V_BIT);
++			if (rc < 0) {
++				dev_err(chip->dev, "Quick Charge 9 V request failed: %d\n", rc);
++			} else {
++				chip->qc_forced = true;
++				dev_info(chip->dev, "Quick Charge %s adapter: requested 9 V\n",
++					 apsd_result & QC_3P0_BIT ? "3.0" : "2.0");
++			}
++		}
++		if (chip->qc_forced)
++			current_ua = QC_9V_CURRENT_UA;
++	} else if (hvdcp && (apsd_result & DCP_CHARGER_BIT) &&
++		   chip->qc_polls < QC_DETECT_POLLS) {
++		/* HVDCP authentication runs after the DCP result: look again */
++		chip->qc_polls++;
++		schedule_delayed_work(&chip->status_change_work,
++				      msecs_to_jiffies(1000));
++	}
++
+ set_current_limit:
+ 	dev_dbg(chip->dev, "input current limit %u uA\n", current_ua);
+ 	smb5_set_current_limit(chip, current_ua);
+@@ -1326,6 +1368,16 @@
+ 					     "%s: init command %d failed\n",
+ 					     __func__, i);
+ 	}
++
++	/* Detection and authentication only; the voltage is requested explicitly */
++	if (hvdcp) {
++		rc = regmap_update_bits(chip->regmap, chip->base + USBIN_OPTIONS_1_CFG,
++					HVDCP_EN_BIT | HVDCP_AUTH_ALG_EN_CFG_BIT |
++					HVDCP_AUTONOMOUS_MODE_EN_CFG_BIT,
++					HVDCP_EN_BIT | HVDCP_AUTH_ALG_EN_CFG_BIT);
++		if (rc < 0)
++			return dev_err_probe(chip->dev, rc, "HVDCP enable failed\n");
++	}
+ 	return 0;
+ }
+ 

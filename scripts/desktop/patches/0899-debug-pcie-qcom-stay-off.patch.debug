@@ -1,0 +1,41 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] DEBUG PCI: qcom: q706f_stay_off test parameter (not for the series)
+
+---
+--- a/drivers/pci/controller/dwc/pcie-qcom.c	2026-11-19 13:40:07.988667103 +0200
++++ b/drivers/pci/controller/dwc/pcie-qcom.c	2026-11-19 13:40:07.994598323 +0200
+@@ -2397,6 +2397,10 @@
+ 	return ret;
+ }
+ 
++/* q706f deep-sleep test: once deinitialised in suspend, keep the host off on resume */
++static bool q706f_stay_off;
++module_param(q706f_stay_off, bool, 0644);
++
+ static int qcom_pcie_suspend_noirq(struct device *dev)
+ {
+ 	struct qcom_pcie *pcie;
+@@ -2406,6 +2410,11 @@
+ 	if (!pcie)
+ 		return 0;
+ 
++	if (q706f_stay_off && pcie->pci->suspended) {
++		dev_info(dev, "q706f: host still off, nothing to suspend\n");
++		return 0;
++	}
++
+ 	ret = dw_pcie_suspend_noirq(pcie->pci);
+ 	if (ret)
+ 		return ret;
+@@ -2464,6 +2473,11 @@
+ 	if (!pcie)
+ 		return 0;
+ 
++	if (q706f_stay_off && pcie->pci->suspended) {
++		dev_info(dev, "q706f: leaving the host off on resume\n");
++		return 0;
++	}
++
+ 	if (pcie->pci->suspended) {
+ 		if (pcie->use_pm_opp) {
+ 			ret = qcom_pcie_set_max_opp(dev);

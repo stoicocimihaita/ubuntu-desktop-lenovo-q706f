@@ -2,3 +2,9 @@
 # 1 = switch Bluetooth off during suspend (saves ~12 mA; the pen reconnects after wake)
 # 0 = keep Bluetooth on while asleep
 BT_OFF_IN_SLEEP=1
+# Switch Wi-Fi off while asleep (1) or keep it on (0).
+WIFI_OFF_IN_SLEEP=0
+# Unload the Wi-Fi driver while asleep (1): needed for repeated deep sleep (problem B).
+# 0 since 20.11.2026: the kernel releases ath11k_pci across suspend itself (patch 0121,
+# /etc/modprobe.d/q706f-ath11k.conf). Set 1 only with an ath11k_pci without 0121.
+WIFI_UNLOAD_IN_SLEEP=0

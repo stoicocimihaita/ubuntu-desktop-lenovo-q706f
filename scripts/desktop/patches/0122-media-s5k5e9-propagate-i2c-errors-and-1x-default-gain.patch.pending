@@ -1,0 +1,107 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] media: i2c: s5k5e9: propagate I2C errors and start at 1x analogue gain
+
+Optional robustness fix for the q706f second rear camera (S5K5E9). It is NOT
+needed for VBLANK support: the driver already exposes a writable
+V4L2_CID_VBLANK (frame_length_lines 0x0340), a read-only V4L2_CID_HBLANK,
+V4L2_CID_PIXEL_RATE, and updates the V4L2_CID_EXPOSURE range to
+height + vblank - 2 whenever VBLANK changes, which is everything libcamera's
+CameraSensor and the AGC frame-duration series need.
+
+What it fixes:
+  - s5k5e9_set_ctrl() wrote group-hold on / register / group-hold off and
+    kept only the last return value, so a failed exposure, gain or VBLANK
+    write (we have seen CCI timeouts on this bus at boot) was reported as
+    success. The three writes now go through s5k5e9_write_held(), which
+    always releases the hold and returns the first error.
+  - s5k5e9_write_reg_list() returned only the status of the last register;
+    it now stops at the first failing write (stream start then fails
+    loudly instead of streaming with a half-programmed sensor).
+  - V4L2_CID_ANALOGUE_GAIN defaulted to 1024 (32x, the maximum), applied by
+    __v4l2_ctrl_handler_setup() at every stream start until userspace sets a
+    gain. Default to 32 (1x).
+
+Risk: if some register in the init tables is NACKed today without visible
+effect, stream start now fails with "Cannot write register"; revert this
+patch in that case. Not tested on the device.
+
+Status: .pending (not applied by the build). Applies with patch -p1 -F0 on
+top of 0001..0120.
+---
+--- a/drivers/media/i2c/s5k5e9.c
++++ b/drivers/media/i2c/s5k5e9.c
+@@ -194,12 +194,35 @@
+ 
+ static int s5k5e9_write_reg_list(struct s5k5e9 *s5k5e9, const struct s5k5e9_reg_list *reg_list)
+ {
+-	int ret = 0;
++	int ret;
+ 
+-	for (unsigned int i = 0; i < reg_list->num_of_regs; i++)
+-		ret = s5k5e9_write(s5k5e9, reg_list->regs[i].address, 1, reg_list->regs[i].val);
++	for (unsigned int i = 0; i < reg_list->num_of_regs; i++) {
++		ret = s5k5e9_write(s5k5e9, reg_list->regs[i].address, 1,
++				   reg_list->regs[i].val);
++		if (ret)
++			return ret;
++	}
+ 
+-	return ret;
++	return 0;
++}
++
++/*
++ * Write one SMIA register inside a grouped parameter hold (0x0104) so that
++ * the sensor latches it at a frame boundary. The hold is always released,
++ * and the first error is returned instead of being overwritten.
++ */
++static int s5k5e9_write_held(struct s5k5e9 *s5k5e9, u16 reg, u16 len, u32 val)
++{
++	int ret, ret2;
++
++	ret = s5k5e9_write(s5k5e9, 0x0104, 1, 0x01);
++	if (ret)
++		return ret;
++
++	ret = s5k5e9_write(s5k5e9, reg, len, val);
++	ret2 = s5k5e9_write(s5k5e9, 0x0104, 1, 0x00);
++
++	return ret ? ret : ret2;
+ }
+ 
+ static int s5k5e9_read(struct s5k5e9 *s5k5e9, u16 reg, u16 len, u32 *val)
+@@ -452,19 +475,14 @@
+ 
+ 	switch (ctrl->id) {
+ 	case V4L2_CID_EXPOSURE:
+-		ret = s5k5e9_write(s5k5e9, 0x0104, 1, 0x01);
+-		ret = s5k5e9_write(s5k5e9, 0x0202, 2, ctrl->val);
+-		ret = s5k5e9_write(s5k5e9, 0x0104, 1, 0x00);
++		ret = s5k5e9_write_held(s5k5e9, 0x0202, 2, ctrl->val);
+ 		break;
+ 	case V4L2_CID_ANALOGUE_GAIN:
+-		ret = s5k5e9_write(s5k5e9, 0x0104, 1, 0x01);
+-		ret = s5k5e9_write(s5k5e9, 0x0204, 2, ctrl->val);
+-		ret = s5k5e9_write(s5k5e9, 0x0104, 1, 0x00);
++		ret = s5k5e9_write_held(s5k5e9, 0x0204, 2, ctrl->val);
+ 		break;
+ 	case V4L2_CID_VBLANK:
+-		ret = s5k5e9_write(s5k5e9, 0x0104, 1, 0x01);
+-		ret = s5k5e9_write(s5k5e9, 0x0340, 2, s5k5e9->cur_mode->height + ctrl->val);
+-		ret = s5k5e9_write(s5k5e9, 0x0104, 1, 0x00);
++		ret = s5k5e9_write_held(s5k5e9, 0x0340, 2,
++					s5k5e9->cur_mode->height + ctrl->val);
+ 		break;
+ 	default:
+ 		ret = -EINVAL;
+@@ -606,8 +624,9 @@
+ 						 exposure_max, 1,
+ 						 exposure_max);
+ 
++	/* Code 32 = 1x (SMIA analogue_gain_code_global); start at 1x, not 32x. */
+ 	v4l2_ctrl_new_std(handler, &s5k5e9_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
+-			  32, 1024, 1, 1024);
++			  32, 1024, 1, 32);
+ 
+ 	if (handler->error) {
+ 		ret = handler->error;

@@ -30,6 +30,7 @@ LONG_PRESS_MS = 1200
 # The screen blanks at once; the suspend itself waits this long, so that opening the
 # cover again (or a second press) right away simply cancels it.
 SUSPEND_DELAY_MS = 3000
+SUSPEND_STUCK_S = 30
 # Written when the user asks for the screen while a suspend is already under way (it
 # cannot be cancelled any more): the q706f-sleep hook then arms a 2 s RTC alarm, and we
 # turn the screen on as soon as the tablet is back.
@@ -56,6 +57,7 @@ class ScreenKeys:
         self.wake_press = False
         self.suspend_id = 0
         self.suspending = False
+        self.suspend_started = 0.0
         self.clear_wake_intent()
         GLib.timeout_add_seconds(1, self.watch_resume)
         self.open_devices()
@@ -77,6 +79,13 @@ class ScreenKeys:
 
     def watch_resume(self):
         self.resumed_just_now()
+        # An aborted s2idle (wake source pending) or a refused Suspend call shows no
+        # BOOTTIME jump: without this the flag stayed set and closing the cover never
+        # blanked or suspended again. CLOCK_MONOTONIC stops while asleep, so 30 s here
+        # means 30 s awake after the request.
+        if self.suspending and time.monotonic() - self.suspend_started > SUSPEND_STUCK_S:
+            log("suspend did not happen within %d s: ready again" % SUSPEND_STUCK_S)
+            self.suspending = False
         return GLib.SOURCE_CONTINUE
 
     # -- D-Bus helpers ------------------------------------------------------
@@ -125,7 +134,9 @@ class ScreenKeys:
         log("suspend is enabled in sleep.conf.d: suspending")
         self.clear_wake_intent()
         self.suspending = True
-        self.logind("Suspend", GLib.Variant("(b)", (False,)))
+        self.suspend_started = time.monotonic()
+        if self.logind("Suspend", GLib.Variant("(b)", (False,))) is None:
+            self.suspending = False
         return GLib.SOURCE_REMOVE
 
     def screen_on(self, why, verify=True):
@@ -200,7 +211,10 @@ class ScreenKeys:
                 self.on_power(value)
             elif role == "lid" and etype == EV_SW and code == SW_LID:
                 if value:
-                    if not self.screen_is_off():
+                    # Also when GNOME has already blanked the screen on idle:
+                    # otherwise closing the cover never suspends (16.11.2026,
+                    # tablet stayed awake 77 min with the cover closed).
+                    if not self.suspending:
                         self.screen_off("cover closed")
                 else:
                     self.screen_on("cover opened")

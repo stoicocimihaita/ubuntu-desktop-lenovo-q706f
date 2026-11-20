@@ -1,0 +1,52 @@
+#!/bin/sh
+# q706f-spktest: speaker-protection test on the tablet (run as root, PipeWire running for user ubuntu).
+# Routes all four CS35L45 through the protection DSP (DACPCM = DSP_TX1), writes the factory CAL_R,
+# plays noise for DURATION seconds at PipeWire volume VOL, logs CSPL telemetry every 5 s and any
+# cs35l45 kernel messages, then restores the bypass routing. The amplifier ceiling
+# (Digital PCM Volume 350) is checked and never changed.
+# Usage: q706f-spktest [DURATION=60] [VOL=0.7]
+DUR=${1:-60}; VOL=${2:-0.7}
+U=ubuntu; UID_=$(id -u $U)
+asuser() { runuser -u $U -- env XDG_RUNTIME_DIR=/run/user/$UID_ "$@"; }
+c() { amixer -q -c0 cset name="$1" "$2"; }
+g() { amixer -c0 cget name="$1" | sed -n 's/.*: values=//p'; }
+WAV=/home/$U/audiodbg/noise.wav
+
+for n in 1 2 3 4; do
+  v=$(g "SPK$n Digital PCM Volume")
+  [ "$v" -le 350 ] 2>/dev/null || { echo "ABORT: SPK$n Digital PCM Volume=$v (> 350)"; exit 1; }
+done
+echo "ceiling ok: Digital PCM Volume <= 350 on all amps"
+/usr/local/libexec/q706f-spk-cal
+OLDVOL=$(asuser wpctl get-volume @DEFAULT_AUDIO_SINK@ | awk '{print $2}')
+START=$(date +%s)
+
+restore() {
+  c "SPK1 DACPCM Source" ASP_RX1; c "SPK2 DACPCM Source" ASP_RX1
+  c "SPK3 DACPCM Source" ASP_RX2; c "SPK4 DACPCM Source" ASP_RX2
+  c "SPK3 ASPRX1 Slot Position" 0; c "SPK4 ASPRX1 Slot Position" 0
+  asuser wpctl set-volume @DEFAULT_AUDIO_SINK@ "$OLDVOL"
+  echo "restored bypass routing, volume $OLDVOL"
+}
+trap restore EXIT
+
+c "SPK3 ASPRX1 Slot Position" 2; c "SPK4 ASPRX1 Slot Position" 2
+for n in 1 2 3 4; do c "SPK$n DACPCM Source" DSP_TX1; done
+asuser wpctl set-volume @DEFAULT_AUDIO_SINK@ "$VOL"
+echo "route: DSP_TX1 on SPK1-4, volume $VOL, $DUR s"
+
+( end=$(( $(date +%s) + DUR )); while [ $(date +%s) -lt $end ]; do asuser pw-play "$WAV"; done ) &
+P=$!
+t=0
+while kill -0 $P 2>/dev/null; do
+  sleep 5; t=$((t+5))
+  line="t=${t}s"
+  for n in 1 2 3 4; do
+    p="SPK$n DSP1 Protection"
+    line="$line | S$n st=$(g "$p cd CSPL_STATE") err=$(g "$p cd CSPL_ERRORNO") T=$(g "$p cd CSPL_TEMPERATURE") hb=$(g "$p 4fa00 HALO_HEARTBEAT")"
+  done
+  echo "$line"
+done
+wait $P
+echo "kernel messages from the amplifiers during the test:"
+journalctl -k --since "@$START" --no-pager -o short-monotonic | grep -iE "cs35l45|5-00[0-9a-f]{2}" || echo "  none"

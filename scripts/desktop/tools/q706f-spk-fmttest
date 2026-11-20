@@ -1,0 +1,12 @@
+#!/bin/sh
+# Which stream format kills the CS35L45 DSPs? Bypass routing, 2 s of silence per format.
+wd() { journalctl -k --since "@$1" --no-pager -o cat | grep -c "DSP Watchdog"; }
+alsaucm -c hw:0 set _verb HiFi set _enadev Speaker >/dev/null 2>&1
+echo "boot watchdogs so far: $(journalctl -k -b --no-pager -o cat | grep -c 'DSP Watchdog')"
+for f in "S16_LE 48000" "S24_LE 48000" "S32_LE 48000" "S16_LE 44100" "S16_LE 96000"; do
+  set -- $f; T=$(date +%s)
+  timeout 6 aplay -q -D hw:0,0 -f $1 -r $2 -c 2 -d 2 /dev/zero 2>&1 | head -1
+  sleep 3
+  echo "$1 $2: watchdogs=$(wd $T)"
+done
+alsaucm -c hw:0 set _verb HiFi set _disdev Speaker >/dev/null 2>&1

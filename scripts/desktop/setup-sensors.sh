@@ -48,6 +48,15 @@ echo "== [1/5] packages (archive)"
 # pulls in qcom-phone-utils + qbootctl + initramfs-tools. droid-juicer.service
 # ends with ExecStartPost=/usr/sbin/reboot and qbootctl.service rewrites the
 # A/B slot flags in the GPT as soon as it is installed.
+PKGS="hexagonrpcd iio-sensor-proxy \
+  git ca-certificates meson ninja-build gcc libc6-dev pkg-config \
+  libglib2.0-dev libqmi-glib-dev libprotobuf-c-dev protobuf-c-compiler \
+  protobuf-compiler python3-dev libgudev-1.0-dev libpolkit-gobject-1-dev \
+  systemd-dev libudev-dev"
+# Simulate first: refuse before anything is installed if a forbidden package would come in.
+ssh "$HOST" "apt-get -s install --no-install-recommends $PKGS" |
+  grep -E '^Inst (droid-juicer|qbootctl|qcom-phone-utils) ' &&
+  { echo "ERROR: apt would install a forbidden package (see above)" >&2; exit 1; }
 ssh "$HOST" 'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   hexagonrpcd iio-sensor-proxy \
   git ca-certificates meson ninja-build gcc libc6-dev pkg-config \

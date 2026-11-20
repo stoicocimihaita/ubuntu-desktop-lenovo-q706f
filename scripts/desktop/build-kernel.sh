@@ -21,8 +21,15 @@ PATCHES="$ROOT/scripts/desktop/patches"
 stamp="$VER $(cat "$PATCHES"/*.patch | sha256sum | cut -c1-16)"
 if [ "$(cat "$SRC/.rev" 2>/dev/null)" != "$stamp" ]; then
   mkdir -p "$DL"
-  [ -f "$DL/$TARBALL" ] || curl -fL -o "$DL/$TARBALL" "$TARBALL_URL"
-  echo "$TARBALL_SHA256  $DL/$TARBALL" | sha256sum -c - >/dev/null
+  if [ ! -f "$DL/$TARBALL" ]; then
+    # Download to .part and keep it only when the checksum matches (no truncated tarball left behind).
+    curl -fL -o "$DL/$TARBALL.part" "$TARBALL_URL"
+    echo "$TARBALL_SHA256  $DL/$TARBALL.part" | sha256sum -c - >/dev/null \
+      || { rm -f "$DL/$TARBALL.part"; echo "sha256 mismatch for $TARBALL" >&2; exit 1; }
+    mv "$DL/$TARBALL.part" "$DL/$TARBALL"
+  fi
+  echo "$TARBALL_SHA256  $DL/$TARBALL" | sha256sum -c - >/dev/null \
+    || { echo "sha256 mismatch for $DL/$TARBALL: delete it to download again" >&2; exit 1; }
   rm -rf "$SRC"; mkdir -p "$SRC"
   tar -C "$SRC" --strip-components=1 -xf "$DL/$TARBALL"
   for p in "$PATCHES"/*.patch; do
@@ -48,6 +55,11 @@ mkdir -p "$OUT/build"
   scripts/kconfig/merge_config.sh -m -O $B $B/.config \
     $D/q706f-desktop.config $D/q706f-7.3-renames.config $D/q706f-7.3.4-extra.config >/dev/null
   $M olddefconfig >/dev/null
+  # Every option the fragments ask for must survive olddefconfig (a missing dependency drops it silently).
+  miss=$(cat $D/q706f-desktop.config $D/q706f-7.3-renames.config $D/q706f-7.3.4-extra.config |
+    grep -oE "^CONFIG_[A-Z0-9_]+=[ym]" | cut -d= -f1 | while read -r k; do
+      grep -qE "^$k=[ym]" $B/.config || echo "$k"; done)
+  [ -z "$miss" ] || { echo "config options dropped by olddefconfig (missing dependency?):" $miss >&2; exit 1; }
   rm -f $B/arch/arm64/boot/Image.gz
   # No pipe here: a compile error must stop the script.
   $M Image.gz dtbs modules > $B/build.log 2>&1 || { grep -E "error|undefined" $B/build.log | head -20; exit 1; }

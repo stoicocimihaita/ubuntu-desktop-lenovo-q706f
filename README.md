@@ -10,9 +10,9 @@ Discussion, questions and test reports: [XDA thread](https://xdaforums.com/t/rom
 - **Stage: bring-up.** It runs as the author's daily test system on **one** tablet
   (8 GB / 256 GB, ROW), but it is not a finished product. Treat it as a developer preview.
 - **Kernel:** upstream **Linux 7.3.4** (kernel.org tarball, sha256 pinned) plus the patch
-  series in [`scripts/desktop/patches/`](scripts/desktop/patches/README) (13 patches: the
+  series in [`scripts/desktop/patches/`](scripts/desktop/patches/README) (28 patches: the
   q706f device support derived from silime's mainline tree, the project's own patches and
-  three upstream fixes/backports).
+  upstream fixes/backports).
 - **Userland:** stock Ubuntu 26.04 (`resolute`) arm64 from `ports.ubuntu.com`, built with
   `mmdebstrap`, plus a small device overlay (udev rules, systemd units, helper scripts).
 - **Boot:** the Lenovo ABL boots a header-v0 `boot.img` (Image.gz + appended mainline DTB +
@@ -39,9 +39,28 @@ it is no longer maintained.
 | ![About](docs/screenshots/03-about.png) | ![On-screen keyboard](docs/screenshots/04-on-screen-keyboard.png) |
 | Settings → About | On-screen keyboard (GJS OSK) |
 
+## What changed since the first release (2026-11-20)
+
+- **Deep sleep works.** The SoC now reaches CX collapse (CXSD) on every suspend:
+  about **52 mA overnight** instead of ~97 mA. Two fixes: `0118` (the sound card released
+  the LPASS clock vote only when the stream closed) and `0121` (the QCA6390 Wi-Fi driver,
+  once resumed, kept CX from collapsing again; it is now unbound across system suspend,
+  `ath11k_pci.unbind_in_suspend=1`, and Wi-Fi reconnects after wake-up).
+- Patches that the author already ran are now in the series (`0014`, `0015`, `0113` pen
+  mode, `0114` camera focus motor, `0203a–e` GPU/GMU, `0204`–`0206`): a plain build gives
+  the same kernel as on the author's tablet.
+- Cameras: GPU debayering in the libcamera soft ISP and colour matrices derived from the
+  stock tuning (`overlay/usr/share/libcamera/ipa/simple/`); colours not confirmed yet.
+- Speakers: `0123` (TEMPMON override as in the vendor driver, correct error IRQ names). The
+  protection DSP still does not run on mainline, so the volume cap stays.
+- Fixes from an audit of the scripts and overlay: suspend state can no longer get stuck in
+  `q706f-screen-keys`, the sleep hook has timeouts, `build-kernel.sh` verifies the tarball
+  and fails if a config option from the fragments is dropped, `kernel-cycle.sh` refuses to
+  push modules from a tree that is not the series, flash LED class enabled.
+
 ## Status
 
-Tested between 2026-11-13 and 2026-11-15 on Linux 7.3.4. "Confirmed" means a person checked
+Tested between 2026-11-13 and 2026-11-20 on Linux 7.3.4. "Confirmed" means a person checked
 the effect on the device; "SSH" means it was only verified with commands and logs.
 
 | Component | State | Notes |
@@ -52,21 +71,21 @@ the effect on the device; "SSH" means it was only verified with commands and log
 | GPU (Adreno 650) | ✅ | Freedreno/Turnip, GNOME accelerated, Vulkan works |
 | Hardware video decoding | ❔ | `qcom_iris` binds; not tested |
 | Touchscreen | ✅ | |
-| Stylus (Precision Pen 3) on screen | ✅ | Pressure 0–4095, separate tablet device. **Needs `0113` (pending patch, see below)** to switch the digitizer into pen mode; tip/hover/tilt changes of `0109` not fully confirmed |
+| Stylus (Precision Pen 3) on screen | ✅ | Pressure 0–4095, separate tablet device. `0113` switches the digitizer into pen mode; tip/hover/tilt changes of `0109` not fully confirmed |
 | Pen over Bluetooth, pen wireless charging (CTN730) | ✅ | Out-of-tree `ctn730` module; charging and battery level confirmed |
 | Rotation / accelerometer, light sensor | ✅ / 🟡 | Through the SLPI sensor DSP: hexagonrpcd + libssc + patched iio-sensor-proxy (`setup-sensors.sh`) |
 | Pogo keyboard / touchpad | 🟡 | Detected, tablet-mode switch implemented; typing and attach/detach not confirmed |
 | On-screen keyboard | ✅ | GJS OSK in the session (`setup-gjs-osk.sh`, optional); GNOME OSK forced on the login screen (not confirmed physically) |
 | Wi-Fi (QCA6390) | ✅ | 2.4 and 5 GHz; generic board data, regulatory domain from the timezone |
 | Bluetooth | ✅ | BLE HID (the pen); BT audio not tested |
-| Speakers (4× CS35L45) | 🟡 | Sound confirmed (L/R with 7.3.4). **No protection DSP:** volume is capped in UCM, see below |
+| Speakers (4× CS35L45) | 🟡 | Sound confirmed (L/R with 7.3.4). **No protection DSP:** the Cirrus protection firmware loads but does not process audio (DSP watchdog when PipeWire starts); volume is capped in UCM, see below |
 | Microphones (WCD938x) | 🟡 | Recording works on 7.1; on 7.3.4 the source is present, quality not judged. Far-field AS33970 array disabled on purpose |
-| Cameras (OV13B10, S5K5E9, OV8856) | 🟡 | All three in libcamera/PipeWire with a software ISP; dark image (no tuning), manual focus only (`0114`, pending) |
+| Cameras (OV13B10, S5K5E9, OV8856) | 🟡 | All three in libcamera/PipeWire with the soft ISP, debayering on the GPU; colour matrices from the stock tuning (colours not confirmed); manual focus (`0114`) |
 | Power button, cover (hall sensor) | ✅ | Both wake the tablet from s2idle |
-| Volume buttons, vibration, flashlight | ❔ | Not tested / LED not exposed |
+| Volume buttons, vibration, flashlight | ❔ | Not tested; flash LED now exposed (`white:flash`), not tested |
 | Battery gauge | ✅ | bq27541: level, voltage, current, temperature; charge limit 4.25 V |
 | Charging | 🟡 | **No 45 W fast charging** (the SMB1396 charge pumps have no mainline driver): 5 V only, about 1.5 A from a wall charger, 500 mA from a PC port. Thermal charging limits are implemented (`0110`) but were not tested hot |
-| Suspend (s2idle) | 🟡 | Enter/wake works (power button, cover). **The SoC never reaches deep sleep** (CX/AOSS/DDR collapse counters stay 0): about 45–110 mA in suspend, ~2 days on a full battery. Root cause not found |
+| Suspend (s2idle) | ✅ | Enter/wake works (power button, cover). Deep sleep (CXSD) on every suspend with `0118` + `0121`: about 52 mA overnight. Bluetooth is off in suspend |
 | USB gadget (NCM + SSH) | ✅ | Fixed address `172.16.42.1` for development and recovery |
 | USB OTG, DisplayPort alt mode, microSD, USB-C audio | ❔ | Not tested |
 | Fingerprint reader (Goodix, in QSEE) | ❌ | Experimental QSEECOM TEE series in `scripts/desktop/patches-fp/`; not part of the normal build |
@@ -80,9 +99,6 @@ Known issues and limits:
   TDM bus; the Cirrus protection firmware (excursion/thermal limiting) is not in the path.
   The UCM profile pins `Digital PCM Volume` to 350 (−14.75 dB) on every amplifier. Do not
   raise it.
-- **Deep sleep does not work** (see above). Several causes were ruled out (interconnect
-  votes, DSPs stopped, PCIe link, LPASS votes); the remaining blocker is not visible from
-  Linux yet. Details: `docs/DE-FACUT.md` section C (Romanian).
 - **Default password.** The image has one account, user `ubuntu`, password `ubuntu`
   (unless built with `USER_PASSWORD=...`), and SSH password login is enabled. Change it at
   the first boot (`install.sh post` offers to). `scripts/desktop/tools/q706f-secure.sh`
@@ -110,18 +126,21 @@ order, with zero fuzz:
 - `0102`–`0111`: this project's patches (stylus/audio DTS, CTN730 node, pogo
   `SW_TABLET_MODE`, panel refresh rate, charge limits and charger input current/thermal
   limits, stylus tip/hover/tilt, AS33970 without firmware download).
+- `0014`, `0015`: disable the unused QCE and PCIe2 nodes.
+- `0113`, `0114`: stylus pen-mode command, rear camera focus motor.
+- `0118`, `0121`, `0123`: deep-sleep fixes (LPASS clock release, ath11k unbind across
+  suspend) and the CS35L45 TEMPMON override.
+- `0203a–e`: upstream RFT "drm/msm: Attach a driver to GMU" (GPU suspend/resume);
+  `0204`–`0206`: sleep-related clock/PCIe/interconnect changes.
 
 Two other kinds of files sit next to them and are **not** applied:
 
-- `*.pending`: prepared patches not yet integrated. The kernel the author actually runs is
-  the series plus `0113` (pen-mode command, needed for the pen), `0114` (rear camera focus
-  motor), `0203a–e` (upstream RFT "drm/msm: Attach a driver to GMU"), `0204`–`0206`
-  (sleep-related clock/PCIe/interconnect changes) and the two proposals `0014`/`0015`,
-  booted without `clk_ignore_unused pd_ignore_unused`. To build the same, rename those files
-  to `.patch`. `0112` and `0115` are untested.
+- `*.pending`: prepared patches not yet integrated (USB-PD 9 V and Quick Charge, untested
+  at 9 V; an ADSP-restart crash fix; an S5K5E9 robustness fix; experiments). The kernel the
+  author runs is exactly the `*.patch` series.
 - `*.needs-approval`: proposals only (RTC offset in a PMIC SDAM cell, AS33970 capture link,
-  Wi-Fi calibration variant, disabling unused QCE/PCIe2). Some write persistent state into
-  chips; read each header first.
+  Wi-Fi calibration variant). Some write persistent state into chips; read each header first.
+- `*.rejected`, `*.debug`: kept for reference, never applied.
 
 ## Requirements
 

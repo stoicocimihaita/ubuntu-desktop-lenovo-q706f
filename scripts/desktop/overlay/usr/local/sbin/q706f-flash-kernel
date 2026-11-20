@@ -223,7 +223,7 @@ cat <<EOF
   WRITE   $NAME  (sha256 ${IMG_SHA:0:16}…, $IMG_SIZE bytes${REL:+, kernel $REL})
   TO      boot_a = $DEV   (slot a, the running slot; boot_b is not touched)
   RISK    if this kernel does not boot, the bootloader falls back to slot b
-          (Ubuntu Touch); recovery then needs the PC (fastboot set_active a, flash)
+          (the other Ubuntu kernel); recovery then needs the PC (fastboot set_active a, flash)
 EOF
 if [ "$DRY" = 1 ]; then
   if [ -t 0 ]; then note "dry run: would now ask you to type boot_a"
@@ -261,6 +261,6 @@ cat <<EOF
    Rollback from this system:   sudo $PROG $BACKUP
    Rollback from the PC:        copy $BACKUP to the PC, then in fastboot:
                                 fastboot flash boot_a $(basename "$BACKUP")
-   If the tablet ends up in Ubuntu Touch (slot b) after a failed boot:
+   If the tablet ends up on slot b after a failed boot:
                                 fastboot set_active a   (then flash the backup)
 EOF

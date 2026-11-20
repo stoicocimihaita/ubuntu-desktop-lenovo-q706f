@@ -1,0 +1,7 @@
+# cam capture script (cam --script=...): ask for a frame duration between 33.3 ms and
+# 66.7 ms (15-30 fps), i.e. allow exposures up to ~66 ms in low light.
+# Only has an effect with a libcamera that contains the AGC frame-duration series
+# (VBLANK in the simple pipeline, patchwork cover 28841, accepted 2026-11-11).
+frames:
+  - 0:
+      FrameDurationLimits: [33333, 66666]

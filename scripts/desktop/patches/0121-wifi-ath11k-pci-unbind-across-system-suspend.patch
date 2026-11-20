@@ -1,0 +1,290 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] wifi: ath11k: pci: optionally unbind the device across system suspend
+
+On the Lenovo Tab P12 Pro (SM8250 + QCA6390) the SoC reaches CX collapse
+(qcom_stats cxsd) on every s2idle suspend only if ath11k_pci is not bound
+while the system goes through suspend/resume. With the driver bound, only
+the first suspend after boot collapses CX; after ath11k's system-resume path
+has run once (resume_early -> hif_power_up -> MHI/firmware boot -> QMI ->
+restart), no further CX collapse happens while the ADSP runs. Unloading the
+module before suspend and loading it again after resume (userspace sleep
+hook) gives CX collapse on every suspend (overnight 52 mA vs 97 mA).
+
+Do the same in the kernel, behind a module parameter (default off):
+  - PM_SUSPEND_PREPARE (before tasks are frozen): release the driver from
+    every bound device;
+  - PM_POST_SUSPEND (tasks thawed): probe them again from a work item, so
+    the resume itself is not delayed by the firmware download.
+
+The per-device PM notifier of ath11k core is replaced by one module-wide
+notifier walking a list: a device cannot be unbound from inside the PM
+notifier chain while its own notifier_block is registered on that chain
+(unregister_pm_notifier() would take the chain rwsem for writing while it
+is held for reading -> deadlock).
+
+Trade-offs: Wi-Fi comes back ~1-2 s after resume (full probe + firmware
+download, same as the hook), the wiphy/netdev is re-registered (phy index
+increases, rfkill soft state of the phy is lost), no WoWLAN (not usable on
+this board anyway: pcie-qcom powers the QCA6390 off via pwrctrl in s2idle).
+
+Status: candidate, compile-checked only (out-of-tree build of ath11k), not tested. Enable with
+  options ath11k_pci unbind_in_suspend=1
+and set WIFI_UNLOAD_IN_SLEEP=0 in /etc/default/q706f-sleep.
+See docs/cercetare-ath11k-2026-11-20.md.
+---
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -1090,7 +1090,7 @@
+ 
+ 	enum ath11k_pm_policy pm_policy;
+ 	enum ath11k_pm_policy actual_pm_policy;
+-	struct notifier_block pm_nb;
++	struct list_head pm_list;
+ 
+ 	/* must be last */
+ 	u8 drv_priv[] __aligned(sizeof(void *));
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -2648,40 +2648,55 @@
+ }
+ EXPORT_SYMBOL(ath11k_core_pre_init);
+ 
++/* One PM notifier for all devices, registered at module load. A per-device
++ * notifier cannot be unregistered while the PM notifier chain is running
++ * (the chain rwsem is held for reading), so a bus driver could not unbind
++ * the device from its own PM notifier (see ath11k_pci unbind_in_suspend).
++ */
++static LIST_HEAD(ath11k_core_pm_list);
++static DEFINE_MUTEX(ath11k_core_pm_lock);
++
+ static int ath11k_core_pm_notify(struct notifier_block *nb,
+ 				 unsigned long action, void *nouse)
+ {
+-	struct ath11k_base *ab = container_of(nb, struct ath11k_base,
+-					      pm_nb);
++	struct ath11k_base *ab;
+ 
+-	switch (action) {
+-	case PM_SUSPEND_PREPARE:
+-		ab->actual_pm_policy = ab->pm_policy;
+-		break;
+-	case PM_HIBERNATION_PREPARE:
+-		ab->actual_pm_policy = ATH11K_PM_DEFAULT;
+-		break;
+-	default:
+-		break;
++	mutex_lock(&ath11k_core_pm_lock);
++	list_for_each_entry(ab, &ath11k_core_pm_list, pm_list) {
++		switch (action) {
++		case PM_SUSPEND_PREPARE:
++			ab->actual_pm_policy = ab->pm_policy;
++			break;
++		case PM_HIBERNATION_PREPARE:
++			ab->actual_pm_policy = ATH11K_PM_DEFAULT;
++			break;
++		default:
++			break;
++		}
+ 	}
++	mutex_unlock(&ath11k_core_pm_lock);
+ 
+ 	return NOTIFY_OK;
+ }
+ 
++static struct notifier_block ath11k_core_pm_nb = {
++	.notifier_call = ath11k_core_pm_notify,
++};
++
+ static int ath11k_core_pm_notifier_register(struct ath11k_base *ab)
+ {
+-	ab->pm_nb.notifier_call = ath11k_core_pm_notify;
+-	return register_pm_notifier(&ab->pm_nb);
++	mutex_lock(&ath11k_core_pm_lock);
++	list_add_tail(&ab->pm_list, &ath11k_core_pm_list);
++	mutex_unlock(&ath11k_core_pm_lock);
++
++	return 0;
+ }
+ 
+ void ath11k_core_pm_notifier_unregister(struct ath11k_base *ab)
+ {
+-	int ret;
+-
+-	ret = unregister_pm_notifier(&ab->pm_nb);
+-	if (ret)
+-		/* just warn here, there is nothing can be done in fail case */
+-		ath11k_warn(ab, "failed to unregister PM notifier %d\n", ret);
++	mutex_lock(&ath11k_core_pm_lock);
++	list_del_init(&ab->pm_list);
++	mutex_unlock(&ath11k_core_pm_lock);
+ }
+ EXPORT_SYMBOL(ath11k_core_pm_notifier_unregister);
+ 
+@@ -2783,6 +2798,7 @@
+ 	init_completion(&ab->htc_suspend);
+ 	init_completion(&ab->wow.wakeup_completed);
+ 	init_completion(&ab->restart_completed);
++	INIT_LIST_HEAD(&ab->pm_list);
+ 
+ 	ab->dev = dev;
+ 	ab->hif.bus = bus;
+@@ -2797,5 +2813,17 @@
+ }
+ EXPORT_SYMBOL(ath11k_core_alloc);
+ 
++static int __init ath11k_core_module_init(void)
++{
++	return register_pm_notifier(&ath11k_core_pm_nb);
++}
++module_init(ath11k_core_module_init);
++
++static void __exit ath11k_core_module_exit(void)
++{
++	unregister_pm_notifier(&ath11k_core_pm_nb);
++}
++module_exit(ath11k_core_module_exit);
++
+ MODULE_DESCRIPTION("Core module for Qualcomm Atheros 802.11ax wireless LAN cards.");
+ MODULE_LICENSE("Dual BSD/GPL");
+--- a/drivers/net/wireless/ath/ath11k/pci.c
++++ b/drivers/net/wireless/ath/ath11k/pci.c
+@@ -8,6 +8,7 @@
+ #include <linux/msi.h>
+ #include <linux/pci.h>
+ #include <linux/of.h>
++#include <linux/suspend.h>
+ #include <linux/time.h>
+ #include <linux/vmalloc.h>
+ 
+@@ -1304,14 +1305,114 @@
+ #endif
+ };
+ 
++/* Some platforms cannot reach SoC deep sleep again once the device has been
++ * through the system-resume path (seen on SM8250 with QCA6390: after the
++ * first resume from a CX collapse no further CX collapse happens while the
++ * ADSP runs). Unbinding before suspend and probing again after resume is
++ * known to avoid that; do it here instead of in a userspace sleep hook.
++ */
++static bool ath11k_pci_unbind_in_suspend;
++module_param_named(unbind_in_suspend, ath11k_pci_unbind_in_suspend, bool, 0644);
++MODULE_PARM_DESC(unbind_in_suspend,
++		 "Unbind the device before system suspend and probe it again after resume (default: false)");
++
++struct ath11k_pci_rebind {
++	struct list_head list;
++	struct pci_dev *pdev;
++};
++
++static LIST_HEAD(ath11k_pci_rebind_list);
++static DEFINE_MUTEX(ath11k_pci_rebind_lock);
++
++static void ath11k_pci_rebind_work_fn(struct work_struct *work)
++{
++	struct ath11k_pci_rebind *e, *tmp;
++	int ret;
++
++	mutex_lock(&ath11k_pci_rebind_lock);
++	list_for_each_entry_safe(e, tmp, &ath11k_pci_rebind_list, list) {
++		ret = device_driver_attach(&ath11k_pci_driver.driver,
++					   &e->pdev->dev);
++		if (ret)
++			dev_warn(&e->pdev->dev,
++				 "failed to probe again after resume: %d\n", ret);
++		list_del(&e->list);
++		pci_dev_put(e->pdev);
++		kfree(e);
++	}
++	mutex_unlock(&ath11k_pci_rebind_lock);
++}
++
++static DECLARE_WORK(ath11k_pci_rebind_work, ath11k_pci_rebind_work_fn);
++
++static int ath11k_pci_rebind_collect(struct device *dev, void *data)
++{
++	struct ath11k_pci_rebind *e;
++
++	e = kzalloc(sizeof(*e), GFP_KERNEL);
++	if (!e)
++		return -ENOMEM;
++
++	e->pdev = pci_dev_get(to_pci_dev(dev));
++	list_add_tail(&e->list, &ath11k_pci_rebind_list);
++
++	return 0;
++}
++
++static int ath11k_pci_pm_notify(struct notifier_block *nb,
++				unsigned long action, void *data)
++{
++	struct ath11k_pci_rebind *e;
++
++	switch (action) {
++	case PM_SUSPEND_PREPARE:
++		if (!ath11k_pci_unbind_in_suspend)
++			break;
++
++		/* a probe from the previous resume may still be running */
++		flush_work(&ath11k_pci_rebind_work);
++
++		mutex_lock(&ath11k_pci_rebind_lock);
++		if (driver_for_each_device(&ath11k_pci_driver.driver, NULL, NULL,
++					   ath11k_pci_rebind_collect))
++			pr_warn("ath11k_pci: could not list all devices to unbind\n");
++		list_for_each_entry(e, &ath11k_pci_rebind_list, list) {
++			dev_info(&e->pdev->dev, "unbinding for system suspend\n");
++			device_release_driver(&e->pdev->dev);
++		}
++		mutex_unlock(&ath11k_pci_rebind_lock);
++		break;
++	case PM_POST_SUSPEND:
++		/* tasks are thawed: firmware loading works, do not delay resume */
++		queue_work(system_unbound_wq, &ath11k_pci_rebind_work);
++		break;
++	default:
++		break;
++	}
++
++	return NOTIFY_OK;
++}
++
++static struct notifier_block ath11k_pci_pm_nb = {
++	.notifier_call = ath11k_pci_pm_notify,
++};
++
+ static int ath11k_pci_init(void)
+ {
+ 	int ret;
+ 
+ 	ret = pci_register_driver(&ath11k_pci_driver);
+-	if (ret)
++	if (ret) {
+ 		pr_err("failed to register ath11k pci driver: %d\n",
+ 		       ret);
++		return ret;
++	}
++
++	ret = register_pm_notifier(&ath11k_pci_pm_nb);
++	if (ret) {
++		pr_err("failed to register ath11k pci PM notifier: %d\n", ret);
++		pci_unregister_driver(&ath11k_pci_driver);
++	}
+ 
+ 	return ret;
+ }
+@@ -1319,6 +1420,15 @@
+ 
+ static void ath11k_pci_exit(void)
+ {
++	struct ath11k_pci_rebind *e, *tmp;
++
++	unregister_pm_notifier(&ath11k_pci_pm_nb);
++	flush_work(&ath11k_pci_rebind_work);
++	list_for_each_entry_safe(e, tmp, &ath11k_pci_rebind_list, list) {
++		list_del(&e->list);
++		pci_dev_put(e->pdev);
++		kfree(e);
++	}
+ 	pci_unregister_driver(&ath11k_pci_driver);
+ }
+ 

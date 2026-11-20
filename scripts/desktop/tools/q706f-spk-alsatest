@@ -1,0 +1,29 @@
+#!/bin/sh
+# Direct ALSA test of the CS35L45 protection path with PipeWire stopped (run as root).
+g() { amixer -c0 cget name="$1" 2>/dev/null | sed -n 's/.*: values=//p' | sed 's/0x00,0x00,//'; }
+c() { amixer -q -c0 cset name="$1" "$2"; }
+python3 - <<'PY'
+import wave, array
+w = wave.open('/home/ubuntu/audiodbg/noise.wav'); p = w.getparams(); d = array.array('h', w.readframes(p.nframes))
+d = array.array('h', (int(x * 0.3) for x in d))
+o = wave.open('/tmp/noise30.wav', 'w'); o.setparams(p); o.writeframes(d.tobytes()); o.close()
+print("noise", p.nchannels, "ch", p.framerate, "Hz", p.sampwidth * 8, "bit", round(p.nframes / p.framerate, 1), "s")
+PY
+for n in 1 2 3 4; do v=$(amixer -c0 cget name="SPK$n Digital PCM Volume" | sed -n 's/.*: values=//p'); [ "$v" -le 350 ] || { echo "ABORT ceiling $v"; exit 1; }; done
+/usr/local/libexec/q706f-spk-cal >/dev/null
+alsaucm -c hw:0 set _verb HiFi set _enadev Speaker || { echo "ucm failed"; exit 1; }
+c "SPK3 ASPRX1 Slot Position" 2; c "SPK4 ASPRX1 Slot Position" 2
+for n in 1 2 3 4; do c "SPK$n DACPCM Source" DSP_TX1; done
+START=$(date +%s)
+aplay -q -D hw:0,0 /tmp/noise30.wav /tmp/noise30.wav &
+P=$!
+t=0
+while kill -0 $P 2>/dev/null; do
+  sleep 4; t=$((t+4)); l="t=${t}s"
+  for n in 1 2 3 4; do p="SPK$n DSP1 Protection"; l="$l | S$n st=$(g "$p cd CSPL_STATE") T=$(g "$p cd CSPL_TEMPERATURE") hb=$(g "$p 4fa00 HALO_HEARTBEAT") at=$(g "$p cd ATTENUATION")"; done
+  echo "$l"
+done
+c "SPK1 DACPCM Source" ASP_RX1; c "SPK2 DACPCM Source" ASP_RX1; c "SPK3 DACPCM Source" ASP_RX2; c "SPK4 DACPCM Source" ASP_RX2
+c "SPK3 ASPRX1 Slot Position" 0; c "SPK4 ASPRX1 Slot Position" 0
+alsaucm -c hw:0 set _verb HiFi set _disdev Speaker
+echo "kernel:"; journalctl -k --since "@$START" --no-pager -o short-monotonic | grep cs35l45 || echo "  none"

@@ -1,0 +1,14 @@
+#!/bin/sh
+# q706f-charger-icl: raise the input current limit for wall chargers that the PM8150B
+# detects as "proprietary" (APSD result OCP: Apple/Samsung/OPPO-style D+/D- dividers).
+# The kernel driver gives those 1.5 A; typical such chargers are rated 2 A or more
+# (tested 15.11.2026 with an OPPO VCA5JAEH, 5 V 2 A: 1.98 A in, VBUS 4.87 V stable,
+# battery current 1.03 -> 1.50 A). AICL stays enabled and lowers the limit by itself if
+# a weaker charger's voltage starts to collapse.
+# Only DCP-class sources at exactly 1.5 A are touched; SDP/CDP/Type-C/PD are left alone.
+P=/sys/class/power_supply/pm8150b-charger
+LIMIT=2000000
+[ "$(cat $P/online 2>/dev/null)" = 1 ] || exit 0
+grep -q '\[DCP\]' $P/usb_type 2>/dev/null || exit 0
+[ "$(cat $P/current_max 2>/dev/null)" = 1500000 ] || exit 0
+echo $LIMIT > $P/current_max && echo "q706f-charger-icl: input limit 1.5 A -> 2.0 A (DCP/proprietary charger)"

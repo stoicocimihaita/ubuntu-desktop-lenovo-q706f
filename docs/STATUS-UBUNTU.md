@@ -1,5 +1,7 @@
 # STATUS-UBUNTU.md — matricea de hardware pentru Ubuntu 26.04 Desktop (mainline) pe q706f
 
+> **Notă 20.11.2026:** documentul nu a mai fost actualizat după 13.11.2026. Starea curentă (somn adânc la fiecare suspendare cu patch-urile 0118 și 0121, ≈52 mA peste noapte) e în `README.md`.
+
 Stare la **13.11.2026**: Ubuntu 26.04.1 arm64, GNOME 50.1 (Wayland), **kernel Linux 7.3.4** (stabil kernel.org +
 seria de 13 patch-uri din `scripts/desktop/patches/`: `0001`, `0002`, `0101`–`0111`, `0201`, `0202`) pe `boot_a`,
 rootfs `/userdata/ubuntu-desktop.img`. 7.3.4 e pe `boot_a` din 13.11.2026, cu două porniri curate de pe partiție.

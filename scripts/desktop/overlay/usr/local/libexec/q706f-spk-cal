@@ -1,0 +1,20 @@
+#!/bin/sh
+# q706f-spk-cal: write the factory speaker calibration (Re, from the stock persist
+# partition, /etc/q706f/spk-cal) into the CS35L45 protection firmware's CAL_R control,
+# exactly as the stock audio HAL does (it writes only "SPKn DSP1 Protection cd CAL_R").
+# DSP RAM only: nothing persistent, the value is cached by the driver and rewritten
+# whenever the DSP restarts. Never run the stock calibration procedure instead.
+CONF=/etc/q706f/spk-cal          # lines: "SPKn b0,b1,b2,b3 decimal"
+[ -r "$CONF" ] || { echo "q706f-spk-cal: $CONF missing"; exit 0; }
+rc=0
+while read -r spk bytes _; do
+	case "$spk" in SPK[1-4]) ;; *) continue ;; esac
+	ctl="$spk DSP1 Protection cd CAL_R"
+	if amixer -q -c0 cset name="$ctl" "$bytes" 2>/dev/null; then
+		got=$(amixer -c0 cget name="$ctl" | sed -n 's/.*: values=//p')
+		echo "q706f-spk-cal: $spk CAL_R <- $bytes (read back $got)"
+	else
+		echo "q706f-spk-cal: $spk: cannot write $ctl"; rc=1
+	fi
+done < "$CONF"
+exit $rc

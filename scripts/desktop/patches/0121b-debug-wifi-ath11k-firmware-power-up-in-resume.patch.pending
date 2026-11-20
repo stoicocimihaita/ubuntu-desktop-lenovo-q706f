@@ -1,0 +1,64 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] DEBUG wifi: ath11k: optionally boot the firmware in resume instead of resume_early
+
+Experiment for deep-sleep problem B (not for upstream): with
+ath11k.debug_late_power_up=1 (kernel cmdline, or options ath11k ... in
+modprobe.d; read-only at runtime) the default (non-WoW) PM policy skips
+hif_power_up() in resume_early and does it at the start of the normal
+resume callback instead. Wi-Fi still resumes (MHI channel devices are kept
+across suspend, so QMI works inside the resume phase).
+
+Question answered: does the phase in which the QCA6390 firmware is booted
+after a CX collapse (early: cpuidle paused, most devices still suspended)
+create the state that blocks later CX collapses? If CXSD repeats with the
+knob, the cause is the phase/ordering; if not, it is something the kept
+driver objects or the firmware boot itself leave behind.
+
+Independent of 0121 (applies with or without it).
+---
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -1284,6 +1284,15 @@
+ }
+ EXPORT_SYMBOL(ath11k_core_suspend_late);
+ 
++/* DEBUG (q706f deep sleep, problem B): boot the firmware in the normal
++ * resume phase instead of resume_early, to test whether the phase in which
++ * the firmware boots after a SoC CX collapse matters. Not for upstream.
++ */
++static bool ath11k_debug_late_power_up;
++module_param_named(debug_late_power_up, ath11k_debug_late_power_up, bool, 0444);
++MODULE_PARM_DESC(debug_late_power_up,
++		 "DEBUG: power the target up in resume instead of resume_early (default: false)");
++
+ int ath11k_core_resume_early(struct ath11k_base *ab)
+ {
+ 	int ret;
+@@ -1295,6 +1304,11 @@
+ 	if (ab->actual_pm_policy == ATH11K_PM_WOW)
+ 		return 0;
+ 
++	if (ath11k_debug_late_power_up) {
++		ath11k_info(ab, "debug: firmware power-up deferred to resume\n");
++		return 0;
++	}
++
+ 	reinit_completion(&ab->restart_completed);
+ 	ret = ath11k_hif_power_up(ab);
+ 	if (ret)
+@@ -1379,6 +1393,15 @@
+ 	if (ab->actual_pm_policy == ATH11K_PM_WOW)
+ 		return ath11k_core_resume_wow(ab);
+ 
++	if (ath11k_debug_late_power_up) {
++		reinit_completion(&ab->restart_completed);
++		ret = ath11k_hif_power_up(ab);
++		if (ret) {
++			ath11k_warn(ab, "failed to power up hif during resume: %d\n", ret);
++			return ret;
++		}
++	}
++
+ 	return ath11k_core_resume_default(ab);
+ }
+ EXPORT_SYMBOL(ath11k_core_resume);

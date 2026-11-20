@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: CC0-1.0
+%YAML 1.1
+---
+# libcamera simple pipeline / SoftISP tuning for the s5k5e9 (ofilm_s5k5e9yx04 module) on the
+# Lenovo Tab P12 Pro (TB-Q706F). Format: libcamera 0.7 src/ipa/simple (BlackLevel,
+# Awb, Ccm, Adjust, Agc), loaded as <sensor model>.yaml from /etc/libcamera/ipa/simple
+# or /usr/share/libcamera/ipa/simple.
+#
+# BlackLevel: 16-bit scale (64 at 10 bits = 4096). PROVISIONAL: usual 10-bit pedestal of Samsung SMIA sensors (64), not confirmed; replace with the dark-frame measurement (scripts/desktop/libcamera/blacklevel.sh).
+#
+# Ccm: copied from the stock Android CamX tuning com.qti.tuned.ofilm_s5k5e9yx04.bin,
+# module cc13, AEC region "lux index 200-310" (indoor). The stock CCT ranges are flat
+# inside a range and interpolated between ranges, so each matrix is listed at both
+# ends of its range. Row order R, G, B (rows sum to 1). The stock matrices were
+# tuned for Qualcomm's own AWB, lens shading and noise reduction; the SoftISP has no
+# LSC (0.7) and no NR, so the low-CCT matrices amplify noise. Extraction details:
+# docs/PLAN-CAMERE-2026-11-20.md.
+version: 1
+algorithms:
+  - BlackLevel:
+      blackLevel: 4096
+  - Awb:
+  - Ccm:
+      ccms:
+        - ct: 2400
+          ccm: [ 1.9645, -1.0396, 0.0751,
+                 -0.3336, 1.2180, 0.1156,
+                 -0.4120, -0.5411, 1.9531 ]
+        - ct: 2600
+          ccm: [ 1.7341, -0.8663, 0.1321,
+                 -0.3377, 1.3592, -0.0216,
+                 -0.1990, -0.5949, 1.7939 ]
+        - ct: 3300
+          ccm: [ 1.7341, -0.8663, 0.1321,
+                 -0.3377, 1.3592, -0.0216,
+                 -0.1990, -0.5949, 1.7939 ]
+        - ct: 3600
+          ccm: [ 2.0061, -1.2700, 0.2639,
+                 -0.3125, 1.2712, 0.0413,
+                 -0.1298, -0.7282, 1.8579 ]
+        - ct: 4400
+          ccm: [ 2.0061, -1.2700, 0.2639,
+                 -0.3125, 1.2712, 0.0413,
+                 -0.1298, -0.7282, 1.8579 ]
+        - ct: 4600
+          ccm: [ 2.0058, -1.2266, 0.2208,
+                 -0.0815, 1.2558, -0.1743,
+                 -0.1314, -0.6972, 1.8287 ]
+        - ct: 5600
+          ccm: [ 2.0058, -1.2266, 0.2208,
+                 -0.0815, 1.2558, -0.1743,
+                 -0.1314, -0.6972, 1.8287 ]
+        - ct: 5800
+          ccm: [ 2.0356, -1.0521, 0.0165,
+                 0.0476, 1.0416, -0.0892,
+                 0.0830, -0.8638, 1.7808 ]
+  - Adjust:
+  - Agc:
+...

@@ -166,7 +166,7 @@ diff --git a/drivers/input/touchscreen/goodix_berlin_core.c b/drivers/input/touc
  	return 0;
  }
  
-@@ -933,7 +1028,40 @@
+@@ -933,7 +1028,46 @@
  	NULL,
  };
  
@@ -190,6 +190,12 @@ diff --git a/drivers/input/touchscreen/goodix_berlin_core.c b/drivers/input/touc
 +	if (error)
 +		return error;
 +
++	/* Powered off in system sleep: resume() sends the stored mode */
++	if (dev->power.is_suspended) {
++		cd->pen_mode = on;
++		return count;
++	}
++
 +	error = goodix_berlin_set_pen_mode(cd, on);
 +
 +	return error ? error : count;
@@ -207,7 +213,7 @@ diff --git a/drivers/input/touchscreen/goodix_berlin_core.c b/drivers/input/touc
  	.bin_attrs = goodix_berlin_bin_attrs,
  };
  
-@@ -964,6 +1092,10 @@
+@@ -964,6 +1098,10 @@
  	cd->irq = irq;
  	cd->ic_data = ic_data;
  
@@ -218,7 +224,7 @@ diff --git a/drivers/input/touchscreen/goodix_berlin_core.c b/drivers/input/touc
  	cd->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
  	if (IS_ERR(cd->reset_gpio))
  		return dev_err_probe(dev, PTR_ERR(cd->reset_gpio),
-@@ -1022,6 +1154,14 @@
+@@ -1022,6 +1160,14 @@
  
  	dev_set_drvdata(dev, cd);
  

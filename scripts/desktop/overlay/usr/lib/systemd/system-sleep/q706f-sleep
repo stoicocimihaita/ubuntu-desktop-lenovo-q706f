@@ -8,7 +8,22 @@
 # - Switch Bluetooth off while asleep (BT_OFF_IN_SLEEP in /etc/default/q706f-sleep):
 #   the controller kept the pen's BLE link up and cost ~12 mA in suspend
 #   (103 vs 115 mA, 15 min tests on 15.11.2026). The pen reconnects after resume.
+# - Disable wake-ups that only cost power while asleep (power-audit 17.11.2026, item 10):
+#   thermal sensors (hardware thermal shutdown still works), the Wi-Fi MHI device and the
+#   DSPs. Buttons, cover, RTC, charger/USB-C and touch keep waking the tablet.
+# - Optionally switch Wi-Fi off while asleep (WIFI_OFF_IN_SLEEP, default off).
 BT_OFF_IN_SLEEP=1
+WIFI_OFF_IN_SLEEP=0
+# Unload the Wi-Fi driver while asleep (WIFI_UNLOAD_IN_SLEEP): with ath11k loaded, its resume after a
+# CX collapse leaves the SoC unable to collapse again while the ADSP runs (deep-sleep problem B, 19.11.2026).
+WIFI_UNLOAD_IN_SLEEP=0
+NOWAKE="/sys/devices/platform/soc@0/c263000.thermal-sensor /sys/devices/platform/soc@0/c265000.thermal-sensor
+ /sys/devices/platform/soc@0/1c00000.pcie/pci0000:00/0000:00:00.0/0000:01:00.0/mhi0
+ /sys/devices/platform/soc@0/17300000.remoteproc /sys/devices/platform/soc@0/8300000.remoteproc
+ /sys/devices/platform/soc@0/5c00000.remoteproc"
+WAKE_SAVE=/run/q706f-wake-disabled
+WIFI_MARK=/run/q706f-wifi-off-in-sleep
+UNLOAD_MARK=/run/q706f-wifi-unloaded-in-sleep
 [ -r /etc/default/q706f-sleep ] && . /etc/default/q706f-sleep
 BT_MARK=/run/q706f-bt-off-in-sleep
 case "$1" in
@@ -18,6 +33,23 @@ case "$1" in
     if [ "$BT_OFF_IN_SLEEP" = 1 ] && rfkill list bluetooth | grep -q 'Soft blocked: no'; then
       rfkill block bluetooth && touch $BT_MARK
     fi
+    if [ "$WIFI_OFF_IN_SLEEP" = 1 ] && rfkill list wlan | grep -q 'Soft blocked: no'; then
+      rfkill block wlan && touch $WIFI_MARK
+    fi
+    if [ "$WIFI_UNLOAD_IN_SLEEP" = 1 ] && lsmod | grep -q "^ath11k_pci "; then
+      # A re-suspend a few seconds after resume can hit the driver while its firmware is
+      # still starting: bound the unload so a hang cannot stall the suspend.
+      if timeout 20 modprobe -r ath11k_pci; then
+        touch $UNLOAD_MARK
+      else
+        logger -t q706f-sleep "ath11k_pci unload failed or timed out: suspending with Wi-Fi loaded"
+        lsmod | grep -q "^ath11k_pci " || touch $UNLOAD_MARK
+      fi
+    fi
+    : > $WAKE_SAVE
+    for d in $NOWAKE; do
+      [ "$(cat $d/power/wakeup 2>/dev/null)" = enabled ] && echo disabled > $d/power/wakeup && echo $d >> $WAKE_SAVE
+    done
     sleep 1
     # The user asked for the screen (cover opened, power key) after the suspend had
     # already started: q706f-screen-keys left a marker. Wake up again in 2 s.
@@ -27,6 +59,14 @@ case "$1" in
     ;;
   post)
     [ -e $BT_MARK ] && { rm -f $BT_MARK; rfkill unblock bluetooth; }
+    if [ -e $UNLOAD_MARK ]; then
+      rm -f $UNLOAD_MARK
+      timeout 20 modprobe ath11k_pci || { sleep 2; timeout 20 modprobe ath11k_pci; } ||
+        logger -t q706f-sleep "ath11k_pci reload failed: no Wi-Fi until 'sudo modprobe ath11k_pci'"
+    fi
+    # After the reload, so that the new phy is unblocked too.
+    [ -e $WIFI_MARK ] && { rm -f $WIFI_MARK; rfkill unblock wlan; }
+    [ -e $WAKE_SAVE ] && { while read -r d; do echo enabled > $d/power/wakeup; done < $WAKE_SAVE; rm -f $WAKE_SAVE; }
     [ -e /sys/class/misc/ctn730/enable ] && echo 1 > /sys/class/misc/ctn730/enable
     systemctl start hexagonrpcd.service 2>/dev/null
     systemctl --no-block start iio-sensor-proxy.service 2>/dev/null

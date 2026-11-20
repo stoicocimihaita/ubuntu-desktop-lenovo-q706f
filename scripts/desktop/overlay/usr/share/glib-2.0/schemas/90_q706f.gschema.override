@@ -12,13 +12,15 @@
 #   upset this panel (DSI command errors)
 [org.gnome.settings-daemon.plugins.power]
 sleep-inactive-ac-type='nothing'
-sleep-inactive-battery-type='nothing'
+sleep-inactive-battery-type='suspend'
+sleep-inactive-battery-timeout=900
 ambient-enabled=false
 power-button-action='nothing'
 
 [org.gnome.settings-daemon.plugins.power:ubuntu]
 sleep-inactive-ac-type='nothing'
-sleep-inactive-battery-type='nothing'
+sleep-inactive-battery-type='suspend'
+sleep-inactive-battery-timeout=900
 ambient-enabled=false
 power-button-action='nothing'
 

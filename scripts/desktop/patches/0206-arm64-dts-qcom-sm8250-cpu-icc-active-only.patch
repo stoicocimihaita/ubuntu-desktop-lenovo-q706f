@@ -7,7 +7,7 @@ vote stays in the RPMh sleep set: DDR never goes to self-refresh and the SoC
 never reaches CX/AOSS sleep in s2idle. Newer SoC trees (sm8450, sm8550, ...)
 use QCOM_ICC_TAG_ACTIVE_ONLY for these paths.
 
-Status: under test (14.11.2026).
+Status: in the series (B3af and later).
 ---
 --- a/arch/arm64/boot/dts/qcom/sm8250.dtsi
 +++ b/arch/arm64/boot/dts/qcom/sm8250.dtsi

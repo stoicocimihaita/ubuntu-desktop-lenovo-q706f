@@ -1,0 +1,8 @@
+#!/bin/sh
+# Drain test with the problem-B fix: waits for the charger to go away, then three 30 min suspends with wake-ups.
+L=/var/log/q706f-drain.log; Q=/sys/kernel/debug/qcom_stats; B=/sys/class/power_supply/bq27541-0
+st(){ echo "  $(date +%T) $1 cxsd=$(awk "/Count/{print \$2}" $Q/cxsd) acc_s=$(awk "/Accumulated/{printf \"%d\", \$3/19200000}" $Q/cxsd) charge_uAh=$(cat $B/charge_now) cap=$(cat $B/capacity) status=$(cat $B/status)"; }
+{ echo "== $(date) drain test (WIFI_UNLOAD_IN_SLEEP=$(grep -o "UNLOAD_IN_SLEEP=[01]" /etc/default/q706f-sleep))"
+until [ "$(cat /sys/class/power_supply/pm8150b-charger/online)" = 0 ]; do sleep 5; done; sleep 30; st unplugged
+for n in 1 2 3; do rtcwake -m no -s 1800 >/dev/null; systemctl suspend; sleep 40; st suspend$n; done
+echo done; } >> $L 2>&1
