@@ -41,6 +41,44 @@ it is no longer maintained.
 | ![About](docs/screenshots/03-about.png) | ![On-screen keyboard](docs/screenshots/04-on-screen-keyboard.png) |
 | Settings → About | On-screen keyboard (GJS OSK) |
 
+## Random resets fixed (2026-11-23, patch `0140`)
+
+The tablet used to reboot by itself under memory-heavy use: installing apps from
+Flathub, GNOME Web on YouTube, opening many apps. Nothing showed up in the kernel log
+or pstore, and the PMIC only recorded a PS_HOLD reset. Disabling Wi-Fi power saving,
+capping the GPU or CPU clock and turning off deep CPU idle did not help.
+
+Reading TrustZone's own diagnostic area (plaintext, read-only through `/dev/mem`;
+`scripts/desktop/tools/q706f-tzwatch`) showed the same thing before every reset: a
+**fatal SGI on one CPU** (a different CPU each time, always the same TZ log codes),
+followed by the secure watchdog reset.
+
+The cause is in `sm8250.dtsi`: `adsp-rpc-remote-heap` (8 MiB) is a *reusable* CMA
+region, and the fastrpc ADSP node hands the whole region to the audio DSP at probe
+(`qcom_scm_assign_mem`, HLOS → LPASS + ADSP_HEAP). Reusable CMA pages are still lent
+to ordinary Linux allocations, so once memory filled up the kernel wrote to pages the
+hypervisor had already taken away from it. **`0140`** makes the region `no-map` on the
+q706f, so Linux never uses it. The same DT and driver code are in 7.3.4, so 7.3.4 builds
+are affected as well.
+
+After `0140` the same load (Flatpak installs, a game, YouTube 4K in GNOME Web, many
+apps, CMA nearly full) ran for over 30 minutes without a reset. Before, it reset within
+1–3 minutes. Results are from one tablet.
+
+Also new:
+
+- **GNOME Web video.** `/usr/local/bin/q706f-epiphany` (used by the desktop entry)
+  makes GStreamer decode VP9 with FFmpeg (`avdec_vp9`) instead of libvpx, and hides the
+  slow libaom AV1 decoder so YouTube serves VP9. Scrolling in GNOME Web is still slower
+  than in Chrome.
+- **Bigger root filesystem.** `make-rootimg.sh` still creates a 14 GB image by default.
+  You can grow it on the running tablet without rebooting (the file is sparse):
+  `sudo truncate -s 200G /userdata/ubuntu-desktop.img && sudo losetup -c /dev/loop0 && sudo resize2fs /dev/loop0`.
+  Pick a size that leaves room on `userdata`.
+- **Diagnostics.** `scripts/desktop/tools/q706f-physread` and `q706f-tzdiag-parse.py`
+  read and decode the TZ diagnostic area. `make-testboot-7.4.sh` accepts `KDIR=` for a
+  debug kernel build.
+
 ## What changed on 2026-11-23 (Linux 7.4-rc3)
 
 The tablet now runs mainline Linux **7.4-rc3** with the patch series in
@@ -74,8 +112,8 @@ Results are from one tablet.
 - **Cameras.** All three (main rear with autofocus, secondary rear, front)
   work on 7.4 in GNOME Camera. The front sensor sometimes fails its first
   probe at boot; `q706f-camera-retry.service` rebinds it.
-- **Still open.** GNOME Web (Epiphany) can freeze or reset the tablet on
-  video; USB controller resume reports `-16` after suspend.
+- **Still open.** USB controller resume reports `-16` after suspend. (The GNOME
+  Web resets listed here before were the CMA problem fixed by `0140`, see above.)
 
 **Developer preview.** Unlocking the bootloader wipes the tablet, and a
 flashing mistake can leave it unbootable. 7.4-rc3 is a release candidate.
@@ -152,8 +190,9 @@ Known issues and limits:
   consistent answers before sending anything; `fastboot reboot bootloader` usually helps.
 - After a failed `fastboot boot` the ABL marks the active slot unbootable and switches
   slots; recover with `fastboot set_active a`.
-- Two complete hangs with an unknown cause were seen; the hardware watchdog and pstore are
-  enabled to catch the next one.
+- Sudden resets and hangs under memory load were caused by the fastrpc remote heap and are
+  fixed by `0140`. A silent freeze during large headless Flatpak downloads has not been
+  re-tested on a `0140` kernel yet. The hardware watchdog and pstore stay enabled.
 - `apt install` only with `--no-install-recommends`: `hexagonrpcd` recommends
   `droid-juicer`, which pulls in `qbootctl` (rewrites A/B flags) and reboots the tablet.
   The overlay pins those packages to priority −1.

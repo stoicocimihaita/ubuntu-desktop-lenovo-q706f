@@ -1,0 +1,5 @@
+#!/bin/sh
+# GNOME Web on the TB-Q706F: decode VP9 with FFmpeg (avdec_vp9, NEON) instead of libvpx (vp9dec has the
+# higher default rank), and hide the slow libaom AV1 decoder so YouTube serves VP9 instead of AV1.
+export GST_PLUGIN_FEATURE_RANK="avdec_vp9:MAX,av1dec:NONE${GST_PLUGIN_FEATURE_RANK:+,$GST_PLUGIN_FEATURE_RANK}"
+exec /usr/bin/epiphany "$@"

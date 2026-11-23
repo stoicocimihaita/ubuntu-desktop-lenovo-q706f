@@ -7,7 +7,8 @@
 # Output: out/desktop/${OUT_NAME:-ubuntu-boot-7.4rc3-<date>.img}
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-K="$ROOT/out/desktop/kernel-7.4"
+# KDIR= overrides the kernel output dir (Image.gz, DTB, modules/), e.g. a debug build.
+K="${KDIR:-$ROOT/out/desktop/kernel-7.4}"
 W="$ROOT/out/desktop/initramfs-7.4"
 RD="$ROOT/out/desktop/initramfs-7.4.cpio.gz"
 [ -f "$K/Image.gz" ] || { echo "run scripts/desktop/build-kernel-7.4.sh first"; exit 1; }
@@ -59,7 +60,7 @@ printf 'kernel+dtb ends at 0x%08x, margin to ramdisk_offset: %d bytes\n' "$END" 
   --header_version 0 --pagesize 4096 --base 0x00000000 \
   --kernel_offset 0x00008000 --ramdisk_offset 0x01000000 --second_offset 0x00f00000 \
   --tags_offset 0x00000100 \
-  --kernel /work/out/desktop/kernel-7.4/Image.gz-dtb \
+  --kernel "/work/${K#"$ROOT"/}/Image.gz-dtb" \
   --ramdisk /work/out/desktop/initramfs-7.4.cpio.gz \
   --cmdline "$CMDLINE" \
   -o "/work/out/desktop/$NAME"

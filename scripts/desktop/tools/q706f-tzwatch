@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""Watch the TZ diag area (read-only /dev/mem, aligned 32-bit loads): print interrupt-counter changes
+and new TZ log lines every 0.5 s. SM8250 tzdbg v9.1 layout (stock Lenovo tz_log.c)."""
+import mmap, os, struct, sys, time
+BASE, SIZE = 0x14695000, 0x3000
+fd = os.open("/dev/mem", os.O_RDONLY | os.O_SYNC)
+m = mmap.mmap(fd, SIZE, mmap.MAP_SHARED, mmap.PROT_READ, offset=BASE)
+w = memoryview(m).cast("I")
+def snap():
+    return b"".join(w[i].to_bytes(4, "little") for i in range(SIZE // 4))
+def ints(d):
+    out = {}
+    o = 0x22c
+    while o + 56 <= 0x118c:
+        num = struct.unpack_from("<I", d, o + 4)[0]
+        desc = d[o + 8:o + 24].split(b"\0")[0].decode(errors="replace")
+        if not desc:
+            break
+        out[(o, num, desc)] = struct.unpack_from("<8I", d, o + 24)
+        o += 56
+    return out
+def logpos(d):
+    return struct.unpack_from("<HH", d, 0x118c - 4)
+d = snap(); prev = ints(d); pw, po = logpos(d)
+print(time.strftime("%T"), "start", {k[2]: sum(v) for k, v in prev.items() if any(v)}, flush=True)
+while True:
+    time.sleep(0.5)
+    d = snap(); cur = ints(d)
+    for k, v in cur.items():
+        if v != prev.get(k):
+            print(time.strftime("%T"), f"INT {k[2]}#{k[1]}", prev.get(k), "->", v, flush=True)
+    prev = cur
+    wr, of = logpos(d)
+    if (wr, of) != (pw, po):
+        ring = d[0x118c:0x118c + 0x1e70]
+        new = ring[po:of] if wr == pw and of > po else ring[po:] + ring[:of]
+        for line in new.replace(b"\0", b"").decode(errors="replace").splitlines():
+            if line.strip():
+                print(time.strftime("%T"), "LOG", line, flush=True)
+        pw, po = wr, of
