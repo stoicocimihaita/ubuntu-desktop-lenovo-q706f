@@ -1,0 +1,120 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] drm/panel: samsung-amsa26zp01: program the refresh rate of the selected mode
+
+The init sequence always wrote 0x60 = 0x20 (120 Hz).  The panel runs in DSI
+command mode, so its own scan/TE rate paces the pipeline: with the 60 Hz
+mode selected the CRTC reported 60 Hz while vsync stayed at 120/s (measured
+on the tablet via the DPU encoder vsync counter).
+
+The vendor on-commands for the 60 fps and 120 fps timings are identical
+except for this register (0x60 = 0x00 for 60 fps, 0x20 for 120 fps), so
+write the value that matches the mode being set.  A 60 <-> 120 switch is a
+full modeset here, hence the init sequence runs again.
+
+Not handled: the vendor "timing switch" commands for a seamless change
+without re-init (60: 60 00; 120: a0 71, 60 20, a0 72).
+
+Compile-tested only (W=1); not tested on the panel.
+
+diff --git a/drivers/gpu/drm/panel/panel-samsung-amsa26zp01.c b/drivers/gpu/drm/panel/panel-samsung-amsa26zp01.c
+index c440f4bbce307a1a67c9004a87918543c07a2144..a661ba10fa06563accecf9c728888cd4c23429b5 100644
+--- a/drivers/gpu/drm/panel/panel-samsung-amsa26zp01.c
++++ b/drivers/gpu/drm/panel/panel-samsung-amsa26zp01.c
+@@ -14,6 +14,8 @@
+ 
+ #include <drm/display/drm_dsc.h>
+ #include <drm/display/drm_dsc_helper.h>
++#include <drm/drm_connector.h>
++#include <drm/drm_crtc.h>
+ #include <drm/drm_mipi_dsi.h>
+ #include <drm/drm_modes.h>
+ #include <drm/drm_panel.h>
+@@ -25,8 +27,18 @@ struct samsung_amsa26zp01 {
+ 	struct drm_dsc_config dsc;
+ 	struct gpio_desc *reset_gpio;
+ 	struct regulator_bulk_data supplies[2];
++	struct drm_connector *connector;
+ };
+ 
++/*
++ * Register 0x60 selects the panel's own scan rate (and with it the TE rate,
++ * which paces the host in command mode). Values from the vendor on-commands
++ * of the 60 fps and 120 fps timings.
++ */
++#define AMSA26ZP01_REFRESH_SELECT	0x60
++#define AMSA26ZP01_REFRESH_60HZ		0x00
++#define AMSA26ZP01_REFRESH_120HZ		0x20
++
+ static inline
+ struct samsung_amsa26zp01 *to_samsung_amsa26zp01(struct drm_panel *panel)
+ {
+@@ -41,7 +53,28 @@ static void samsung_amsa26zp01_reset(struct samsung_amsa26zp01 *ctx)
+ 	msleep(400);
+ }
+ 
+-static void samsung_amsa26zp01_on(struct mipi_dsi_multi_context *dsi_ctx)
++/*
++ * drm_panel has no mode_set hook, so look the mode up through the connector
++ * we were handed in get_modes(). prepare() runs from the atomic commit tail,
++ * where connector->state already is the state being committed.
++ */
++static bool samsung_amsa26zp01_is_60hz(struct samsung_amsa26zp01 *ctx)
++{
++	struct drm_connector *connector = ctx->connector;
++	const struct drm_crtc_state *crtc_state;
++
++	if (!connector || !connector->state || !connector->state->crtc)
++		return false;
++
++	crtc_state = connector->state->crtc->state;
++	if (!crtc_state || !crtc_state->enable)
++		return false;
++
++	return drm_mode_vrefresh(&crtc_state->mode) <= 60;
++}
++
++static void samsung_amsa26zp01_on(struct mipi_dsi_multi_context *dsi_ctx,
++				  bool is_60hz)
+ {
+ 
+ 	mipi_dsi_generic_write_seq_multi(dsi_ctx, 0xf0, 0x5a, 0x5a);
+@@ -50,11 +83,13 @@ static void samsung_amsa26zp01_on(struct mipi_dsi_multi_context *dsi_ctx)
+ 
+ 	mipi_dsi_generic_write_seq_multi(dsi_ctx, 0xf8, 0x58, 0x00, 0x10, 0x54);
+ 	mipi_dsi_generic_write_seq_multi(dsi_ctx, 0xf9, 0x04, 0x85);
+-	/* refresh rate Transition */
+-	/* 60 Hz */
+-	// mipi_dsi_generic_write_seq_multi(dsi_ctx, 0x60, 0x00);
+-	/* 120 Hz */
+-	mipi_dsi_generic_write_seq_multi(dsi_ctx, 0x60, 0x20);
++	/* refresh rate of the mode being set */
++	if (is_60hz)
++		mipi_dsi_generic_write_seq_multi(dsi_ctx, AMSA26ZP01_REFRESH_SELECT,
++						 AMSA26ZP01_REFRESH_60HZ);
++	else
++		mipi_dsi_generic_write_seq_multi(dsi_ctx, AMSA26ZP01_REFRESH_SELECT,
++						 AMSA26ZP01_REFRESH_120HZ);
+ 	mipi_dsi_msleep(dsi_ctx, 50);
+ 	// #define SAMSUNG_BRIGHTNESS_MODE	0x53
+ 	// mipi_dsi_generic_write_seq_multi(dsi_ctx, SAMSUNG_BRIGHTNESS_MODE, 0xE0);
+@@ -93,7 +128,7 @@ static int samsung_amsa26zp01_prepare(struct drm_panel *panel)
+ 
+ 	samsung_amsa26zp01_reset(ctx);
+ 
+-	samsung_amsa26zp01_on(&dsi_ctx);
++	samsung_amsa26zp01_on(&dsi_ctx, samsung_amsa26zp01_is_60hz(ctx));
+ 
+ 	drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
+ 	// print_hex_dump_bytes("pps: ", DUMP_PREFIX_OFFSET, &pps, sizeof(pps));
+@@ -152,8 +187,11 @@ static const struct drm_display_mode samsung_2k_dsc_120_mode = {
+ static int samsung_amsa26zp01_get_modes(struct drm_panel *panel,
+ 				     struct drm_connector *connector)
+ {
++	struct samsung_amsa26zp01 *ctx = to_samsung_amsa26zp01(panel);
+ 	int count = 0;
+ 
++	ctx->connector = connector;
++
+ 	/* Initialize 120Hz first */
+ 	count += drm_connector_helper_get_modes_fixed(connector, &samsung_2k_dsc_120_mode);
+ 	count += drm_connector_helper_get_modes_fixed(connector, &samsung_2k_dsc_60_mode);

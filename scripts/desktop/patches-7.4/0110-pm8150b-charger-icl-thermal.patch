@@ -1,0 +1,1384 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] q706f: pm8150b charger: input current limit per source, battery temperature protection
+
+Input current limit
+  A wall charger on an A-to-C cable (APSD result DCP/OCP, Type-C Rp
+  default) charged with only 900 mA. For Rp-default TCPM asks
+  qcom_pmic_typec for the limit, which returns this charger's own
+  CURRENT_MAX (900 mA right after attach); the charger then took
+  min(DCP limit, TCPM CURRENT_MAX) and so latched its own start value.
+  Nothing re-evaluated the limit when TCPM changed either.
+  - PD contract: min(contract current, 3 A), from the TCPM supplier.
+  - Otherwise Type-C Rp read from the PMIC (TYPE_C_SNK_STATUS): 3 A / 1.5 A.
+  - Rp default: BC1.2 (APSD): SDP 500 mA, CDP 1.5 A, DCP/QC 2 A,
+    proprietary (OCP) 1.5 A, floating data lines 500 mA.
+  - 500 mA while APSD runs and after unplug.
+  - Re-evaluate on supplier changes (external_power_changed).
+  - Vendor SW_OVERRIDE_HC_MODE (ICL_OVERRIDE_AFTER_APSD) so that
+    USBIN_CURRENT_LIMIT_CFG is what applies; AICL stays enabled.
+
+Battery temperature
+  New: the temperature of the battery this charger supplies (the gauge
+  power supply, as the vendor kernel does) is polled every 10 s while a
+  source is attached. Window from the battery node, vendor values
+  (lenovo-jeita.c, "P12_battery" profile) as fallback:
+    < 0 degC or > 50 degC   charging disabled (health Cold / Overheat)
+    <= 15 degC              charge current 1.5 A (Cool)
+    > 45 degC               float voltage 4.2 V (Warm)
+    no temperature / asleep 1.5 A and 4.2 V
+  2 degC hysteresis when leaving a zone; three failed reads are
+  tolerated. Suspend and shutdown leave the restricted limits (or
+  charging off when already cold/hot) because the PMIC keeps charging
+  with nothing watching. The PMIC hardware JEITA stays as it was.
+
+Status and measurements
+  - STATUS used the PMI8998 state encoding and an "inhibit" bit that
+    does not exist on PM8150B: a charging battery read "Not charging".
+  - CURRENT_NOW is the USB input current: the ADC channel gives uV at
+    0.2 V/A, so multiply by 5 (it read 176 mA at 900 mA). VOLTAGE_NOW
+    (VBUS) and CURRENT_NOW no longer read 0 whenever STATUS is not
+    "Charging".
+  - HEALTH reports battery over-voltage instead of logging an error on
+    every read.
+  - CONSTANT_CHARGE_CURRENT / CONSTANT_CHARGE_VOLTAGE show the limits
+    in force (read-only).
+
+Termination and recharge
+  Programmed from charge-term-current-microamp and
+  re-charge-voltage-microvolt when present; DTS: the vendor values for
+  this cell at a 4.25 V float voltage (1.7 A, 4.10 V).
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+index 53c8c038a092a65c6c023418072f79d1f20c4b5d..5d045f19e00dba777a381b8fbaca6e35588d1e5b 100644
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+@@ -84,6 +84,27 @@ battery: battery {
+ 		 * mitigation level.
+ 		 */
+ 		constant-charge-current-max-microamp = <3000000>;
++		/*
++		 * Vendor qcom,chg-term-current-ma = <(-1700)>: charging ends
++		 * once the cell is at the float voltage and takes less than
++		 * 1.7 A (the bq27541 flags "full" on about the same condition).
++		 * Without the charge pumps the cell rarely takes more than
++		 * that, so charging ends soon after the float voltage is
++		 * reached; lower this for a longer constant-voltage phase.
++		 */
++		charge-term-current-microamp = <1700000>;
++		/*
++		 * Vendor recharge threshold for a 4.25 V float voltage
++		 * (EXFG_STEP3_RECHARGE_VOLTAGE_MV); 4.38 V goes with 4.49 V.
++		 */
++		re-charge-voltage-microvolt = <4100000>;
++		/*
++		 * Vendor qcom,jeita-fcc-ranges / qcom,jeita-fv-ranges of the
++		 * "P12_battery" profile: no charging outside 0-50 degC, less
++		 * current up to 15 degC, 4.2 V float above 45 degC.
++		 */
++		operating-range-celsius = <0 50>;
++		alert-celsius = <15 45>;
+ 	};
+ 
+ 	gpio-hall-sensor {
+diff --git a/drivers/power/supply/qcom_pm8150b_charger.c b/drivers/power/supply/qcom_pm8150b_charger.c
+index ad1b15a8426f0b283b24e4bda55b9b03606f1557..dbbfbff9bc26d8554c1c4bf41313f64bf20403b7 100644
+--- a/drivers/power/supply/qcom_pm8150b_charger.c
++++ b/drivers/power/supply/qcom_pm8150b_charger.c
+@@ -9,19 +9,25 @@
+  * Should be merged with the existing charger driver in the future.
+  */
+ 
++#include <linux/bitfield.h>
+ #include <linux/bits.h>
+ #include <linux/devm-helpers.h>
+ #include <linux/iio/consumer.h>
+ #include <linux/interrupt.h>
+ #include <linux/kernel.h>
++#include <linux/math64.h>
+ #include <linux/minmax.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/platform_device.h>
++#include <linux/pm.h>
+ #include <linux/pm_wakeirq.h>
+ #include <linux/of.h>
+ #include <linux/power_supply.h>
+ #include <linux/regmap.h>
++#include <linux/string.h>
+ #include <linux/types.h>
++#include <linux/unaligned.h>
+ #include <linux/workqueue.h>
+ 
+ /* clang-format off */
+@@ -32,15 +38,12 @@
+ #define STEP_CHARGING_STATUS_MASK			GENMASK(5, 3)
+ #define BATTERY_CHARGER_STATUS_MASK			GENMASK(2, 0)
+ 
++/*
++ * Only BAT_OV is documented for PM8150B (vendor smb5-reg.h); the other bits
++ * of this register do not have the PMI8998 meaning.
++ */
+ #define BATTERY_CHARGER_STATUS_2			0x07
+-#define DROP_IN_BATTERY_VOLTAGE_REFERENCE_BIT		BIT(7)
+-#define VBATT_LTET_RECHARGE_BIT				BIT(6)
+-#define VBATT_GTET_INHIBIT_BIT				BIT(5)
+-#define VBATT_GTET_FLOAT_VOLTAGE_BIT			BIT(4)
+-#define BATT_GT_FULL_ON_BIT				BIT(3)
+-#define CHARGER_ERROR_STATUS_SFT_EXPIRE_BIT		BIT(2)
+ #define CHARGER_ERROR_STATUS_BAT_OV_BIT			BIT(1)
+-#define CHARGER_ERROR_STATUS_BAT_TERM_MISSING_BIT	BIT(0)
+ 
+ #define BATTERY_CHARGER_STATUS_4		0x0A
+ #define CHARGE_CURRENT_REFERENCE_MASK		GENMASK(7, 0)
+@@ -60,11 +63,9 @@
+ #define CHARGING_ENABLE_POF_BIT			BIT(1)
+ 
+ #define CHGR_CFG2				0x51
+-#define EN_FAVOR_IN_BIT				BIT(5)
+-#define BAT_OV_ECC_BIT				BIT(4)
+-#define I_TERM_BIT				BIT(3)
+-#define AUTO_RECHG_BIT				BIT(2)
+-#define SOC_BASED_RECHG_BIT			BIT(1)
++#define CHARGER_EN_ITERM_BIT			BIT(3)
++#define RECHG_MASK				GENMASK(2, 1)
++#define VBAT_BASED_RECHG_BIT			BIT(2)
+ #define CHARGER_INHIBIT_BIT			BIT(0)
+ 
+ #define PRE_CHARGE_CURRENT_CFG			0x60
+@@ -73,12 +74,21 @@
+ #define FAST_CHARGE_CURRENT_CFG			0x61
+ #define FAST_CHARGE_CURRENT_SETTING_MASK	GENMASK(7, 0)
+ 
++/* Signed 16 bit, big endian, 10 A full scale; charging current is negative */
++#define CHGR_ADC_ITERM_UP_THD_MSB		0x67
++
++#define CHGR_NO_SAMPLE_TERM_RCHG_CFG		0x6B
++#define NO_OF_SAMPLE_FOR_RCHG_MASK		GENMASK(3, 2)
++
+ #define FLOAT_VOLTAGE_CFG			0x70
+ #define FLOAT_VOLTAGE_SETTING_MASK		GENMASK(7, 0)
+ 
+ #define CHARGE_RCHG_SOC_THRESHOLD_CFG_REG	0x7D
+ #define CHARGE_RCHG_SOC_THRESHOLD_CFG_MASK	GENMASK(7, 0)
+ 
++/* Unsigned 16 bit, big endian, 194.637 uV per LSB */
++#define CHGR_ADC_RECHARGE_THRESHOLD_MSB		0x7E
++
+ #define ICL_STATUS				0x107
+ #define ICL_INPUT_CURRENT_LIMIT_MASK		GENMASK(7, 0)
+ 
+@@ -251,11 +261,20 @@
+ #define AICL_RERUN_TIME_CFG			0x661
+ #define AICL_RERUN_TIME_MASK			GENMASK(1, 0)
+ 
+-/* Match the enumerated SuperSpeed SDP limit used by the vendor firmware. */
+-#define SDP_CURRENT_UA			900000
+-#define CDP_CURRENT_UA			3000000
+-#define DCP_CURRENT_UA			3300000
+-#define CURRENT_MAX_UA			DCP_CURRENT_UA
++/*
++ * Input current limits per source type. BC1.2 results only count when the
++ * Type-C source advertises the default current (legacy A-to-C cable or
++ * default Rp); otherwise the Type-C advertisement or the PD contract wins.
++ * AICL stays enabled and backs off further on weak sources.
++ */
++#define SDP_CURRENT_UA			500000	/* USB 2.0 configured device */
++#define FLOAT_CURRENT_UA		500000	/* data lines open: unknown source */
++#define CDP_CURRENT_UA			1500000	/* BC1.2 CDP, vendor CDP_CURRENT_UA */
++#define OCP_CURRENT_UA			1500000	/* proprietary divider chargers */
++#define DCP_CURRENT_UA			2000000	/* vendor uses 3 A; stay conservative */
++#define TYPEC_MEDIUM_CURRENT_UA		1500000
++#define TYPEC_HIGH_CURRENT_UA		3000000
++#define CURRENT_MAX_UA			3000000
+ 
+ /* pm8150b registers represent current in increments of 1/20th of an amp */
+ #define CURRENT_SCALE_FACTOR		50000
+@@ -271,19 +290,76 @@
+ 
+ /* PM8150B fast charge current: 50 mA per LSB (vendor smb5_pm8150b_params.fcc) */
+ #define FAST_CHARGE_CURRENT_MAX_UA	8000000
++
++/* USB_IN_I ADC channel: 0.2 V/A in buck (charging) mode on PM8150B */
++#define USBIN_I_UV_TO_UA(uv)		((uv) * 5)
++
++/* Termination current ADC threshold: +-10 A over the s16 range */
++#define ITERM_LIMIT_UA			10000000
++#define ITERM_ADC_FULL_SCALE		32767
++/* Recharge voltage ADC threshold */
++#define RECHG_ADC_LSB_NV		194637
++
++/*
++ * Software battery temperature protection, vendor lenovo-jeita.c and the
++ * "P12_battery" profile (qcom,jeita-fcc-ranges / qcom,jeita-fv-ranges):
++ * no charging below 0 degC and above 50 degC, 4.2 V float above 45 degC,
++ * reduced current at or below 15 degC. The window comes from the battery node
++ * (operating-range-celsius, alert-celsius); these are the fallbacks, in
++ * tenths of a degree Celsius.
++ */
++#define TEMP_COLD_DEFAULT		0
++#define TEMP_COOL_DEFAULT		150
++#define TEMP_WARM_DEFAULT		450
++#define TEMP_HOT_DEFAULT		500
++#define TEMP_HYSTERESIS			20
++/* Anything outside this is a broken reading, not a temperature */
++#define TEMP_PLAUSIBLE_MIN		(-400)
++#define TEMP_PLAUSIBLE_MAX		1000
++/* Vendor: 1.5 A in the cool range once the cell is above 4.2 V */
++#define COOL_CHARGE_CURRENT_UA		1500000
++/* Vendor qcom,jeita-fv-ranges, 45.1-50 degC */
++#define WARM_FLOAT_VOLTAGE_UV		4200000
++#define THERMAL_POLL_MS			10000
++#define THERMAL_READ_RETRIES		3
+ /* clang-format on */
+ 
++/* BATTERY_CHARGER_STATUS_1 on PM8150B (vendor smb5-reg.h), not PMI8998 */
+ enum charger_status {
+-	TRICKLE_CHARGE = 0,
++	INHIBIT_CHARGE = 0,
++	TRICKLE_CHARGE,
+ 	PRE_CHARGE,
+-	FAST_CHARGE,
+ 	FULLON_CHARGE,
+ 	TAPER_CHARGE,
+ 	TERMINATE_CHARGE,
+-	INHIBIT_CHARGE,
++	PAUSE_CHARGE,
+ 	DISABLE_CHARGE,
+ };
+ 
++/*
++ * Battery temperature zones, coldest first. TEMP_UNKNOWN (no usable
++ * temperature: gauge missing, read error, system asleep) applies the cool
++ * current and the warm float voltage together, which is within the vendor
++ * limits anywhere inside the allowed window.
++ */
++enum smb5_temp_zone {
++	TEMP_COLD = 0,
++	TEMP_COOL,
++	TEMP_NORMAL,
++	TEMP_WARM,
++	TEMP_HOT,
++	TEMP_UNKNOWN,
++};
++
++static const char * const smb5_temp_zone_names[] = {
++	[TEMP_COLD] = "cold",
++	[TEMP_COOL] = "cool",
++	[TEMP_NORMAL] = "normal",
++	[TEMP_WARM] = "warm",
++	[TEMP_HOT] = "hot",
++	[TEMP_UNKNOWN] = "unknown",
++};
++
+ struct smb5_register {
+ 	u16 addr;
+ 	u8 mask;
+@@ -303,6 +379,18 @@ struct smb5_register {
+  * @usb_in_i_chan:	USB_IN current measurement channel
+  * @usb_in_v_chan:	USB_IN voltage measurement channel
+  * @chg_psy:		Charger power supply instance
++ * @lock:		Protects the charge limits and the fields below
++ * @thermal_work:	Battery temperature poll while a charger is attached
++ * @zone:		Current battery temperature zone
++ * @temp_fails:		Consecutive failed temperature reads
++ * @asleep:		Suspended or shutting down: nothing polls the temperature
++ * @user_chg_en:	Charging enable requested through sysfs
++ * @fv_max_uv:		Float voltage in the normal temperature zone
++ * @fcc_max_ua:		Fast charge current in the normal temperature zone
++ * @temp_cold:		Below this (0.1 degC) charging is disabled
++ * @temp_cool:		At or below this the charge current is reduced
++ * @temp_warm:		Above this the float voltage is reduced
++ * @temp_hot:		Above this charging is disabled
+  */
+ struct smb5_chip {
+ 	struct device *dev;
+@@ -319,6 +407,19 @@ struct smb5_chip {
+ 	struct iio_channel *usb_in_v_chan;
+ 
+ 	struct power_supply *chg_psy;
++
++	struct mutex lock;
++	struct delayed_work thermal_work;
++	enum smb5_temp_zone zone;
++	unsigned int temp_fails;
++	bool asleep;
++	bool user_chg_en;
++	int fv_max_uv;
++	int fcc_max_ua;
++	int temp_cold;
++	int temp_cool;
++	int temp_warm;
++	int temp_hot;
+ };
+ 
+ static enum power_supply_property smb5_properties[] = {
+@@ -332,6 +433,8 @@ static enum power_supply_property smb5_properties[] = {
+ 	POWER_SUPPLY_PROP_ONLINE,
+ 	POWER_SUPPLY_PROP_USB_TYPE,
+ 	POWER_SUPPLY_PROP_CHARGING_ENABLED,
++	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
++	POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE,
+ };
+ 
+ static int smb5_get_prop_usb_online(struct smb5_chip *chip, int *val)
+@@ -352,19 +455,13 @@ static int smb5_get_prop_usb_online(struct smb5_chip *chip, int *val)
+ /*
+  * Qualcomm "automatic power source detection" aka APSD
+  * tells us what type of charger we're connected to.
++ * Returns -EAGAIN while the detection is still running.
+  */
+-static int smb5_apsd_get_charger_type(struct smb5_chip *chip, int *val)
++static int smb5_apsd_get_result(struct smb5_chip *chip, unsigned int *result)
+ {
+-	unsigned int apsd_stat, stat;
+-	int usb_online = 0;
++	unsigned int apsd_stat;
+ 	int rc;
+ 
+-	rc = smb5_get_prop_usb_online(chip, &usb_online);
+-	if (!usb_online) {
+-		*val = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+-		return rc;
+-	}
+-
+ 	rc = regmap_read(chip->regmap, chip->base + APSD_STATUS, &apsd_stat);
+ 	if (rc < 0) {
+ 		dev_err(chip->dev, "Failed to read apsd status, rc = %d", rc);
+@@ -375,33 +472,126 @@ static int smb5_apsd_get_charger_type(struct smb5_chip *chip, int *val)
+ 		return -EAGAIN;
+ 	}
+ 
+-	rc = regmap_read(chip->regmap, chip->base + APSD_RESULT_STATUS, &stat);
++	rc = regmap_read(chip->regmap, chip->base + APSD_RESULT_STATUS, result);
+ 	if (rc < 0) {
+ 		dev_err(chip->dev, "Failed to read apsd result, rc = %d", rc);
+ 		return rc;
+ 	}
+ 
+-	stat &= APSD_RESULT_STATUS_MASK;
++	*result &= APSD_RESULT_STATUS_MASK;
++
++	return 0;
++}
++
++static int smb5_apsd_get_charger_type(struct smb5_chip *chip, int *val)
++{
++	unsigned int stat;
++	int usb_online = 0;
++	int rc;
++
++	*val = POWER_SUPPLY_USB_TYPE_UNKNOWN;
++
++	rc = smb5_get_prop_usb_online(chip, &usb_online);
++	if (!usb_online)
++		return rc;
++
++	rc = smb5_apsd_get_result(chip, &stat);
++	if (rc == -EAGAIN)
++		return 0;
++	if (rc < 0)
++		return rc;
+ 
+-	if (stat & CDP_CHARGER_BIT){
++	if (stat & CDP_CHARGER_BIT)
+ 		*val = POWER_SUPPLY_USB_TYPE_CDP;
+-	} else if (stat & DCP_CHARGER_BIT){
++	else if (stat & (DCP_CHARGER_BIT | OCP_CHARGER_BIT | FLOAT_CHARGER_BIT |
++			 QC_2P0_BIT | QC_3P0_BIT))
+ 		*val = POWER_SUPPLY_USB_TYPE_DCP;
+-	} else if (stat & OCP_CHARGER_BIT){
+-		*val = POWER_SUPPLY_USB_TYPE_DCP;
+-	} else if (stat & FLOAT_CHARGER_BIT){
+-		*val = POWER_SUPPLY_USB_TYPE_DCP;
+-	} else if (stat & QC_2P0_BIT){
+-		*val = POWER_SUPPLY_USB_TYPE_DCP;
+-	} else if (stat & QC_3P0_BIT){
+-		*val = POWER_SUPPLY_USB_TYPE_DCP;
+-	} else {
++	else
+ 		*val = POWER_SUPPLY_USB_TYPE_SDP;
+-	}
+ 
+ 	return 0;
+ }
+ 
++/* Input current limit for a BC1.2 result, see the *_CURRENT_UA comments */
++static unsigned int smb5_apsd_to_current(unsigned int result)
++{
++	if (result & CDP_CHARGER_BIT)
++		return CDP_CURRENT_UA;
++	if (result & (DCP_CHARGER_BIT | QC_2P0_BIT | QC_3P0_BIT))
++		return DCP_CURRENT_UA;
++	if (result & OCP_CHARGER_BIT)
++		return OCP_CURRENT_UA;
++	if (result & FLOAT_CHARGER_BIT)
++		return FLOAT_CURRENT_UA;
++
++	return SDP_CURRENT_UA;
++}
++
++/*
++ * Current advertised by the Type-C source through Rp, 0 for the default
++ * (USB) current. This is read from the PMIC rather than from the TCPM power
++ * supply: for Rp-default TCPM reports whatever qcom_pmic_typec got from this
++ * charger's own CURRENT_MAX, so taking it as a limit would latch the input
++ * current at the value that happened to be set when the cable was attached.
++ */
++static unsigned int smb5_typec_rp_current(struct smb5_chip *chip)
++{
++	unsigned int stat;
++	int rc;
++
++	rc = regmap_read(chip->regmap, chip->base + TYPE_C_SNK_STATUS, &stat);
++	if (rc < 0)
++		return 0;
++
++	if (stat & SNK_RP_3P0_BIT)
++		return TYPEC_HIGH_CURRENT_UA;
++	if (stat & SNK_RP_1P5_BIT)
++		return TYPEC_MEDIUM_CURRENT_UA;
++
++	return 0;
++}
++
++/* True when TCPM has an explicit PD contract; *current_ua is its current */
++static bool smb5_pd_current(struct smb5_chip *chip, unsigned int *current_ua)
++{
++	union power_supply_propval val;
++	int rc;
++
++	rc = power_supply_get_property_from_supplier(chip->chg_psy,
++						     POWER_SUPPLY_PROP_ONLINE,
++						     &val);
++	if (rc || !val.intval)
++		return false;
++
++	rc = power_supply_get_property_from_supplier(chip->chg_psy,
++						     POWER_SUPPLY_PROP_USB_TYPE,
++						     &val);
++	if (rc)
++		return false;
++
++	switch (val.intval) {
++	case POWER_SUPPLY_USB_TYPE_PD:
++	case POWER_SUPPLY_USB_TYPE_PD_DRP:
++	case POWER_SUPPLY_USB_TYPE_PD_PPS:
++	case POWER_SUPPLY_USB_TYPE_PD_SPR_AVS:
++	case POWER_SUPPLY_USB_TYPE_PD_PPS_SPR_AVS:
++		break;
++	default:
++		return false;
++	}
++
++	/* Do not fall back to an unverified BC1.2 high-current result. */
++	*current_ua = SDP_CURRENT_UA;
++
++	rc = power_supply_get_property_from_supplier(chip->chg_psy,
++						     POWER_SUPPLY_PROP_CURRENT_MAX,
++						     &val);
++	if (!rc && val.intval > 0)
++		*current_ua = min_t(unsigned int, val.intval, CURRENT_MAX_UA);
++
++	return true;
++}
++
+ static int smb5_get_prop_charging_enabled(struct smb5_chip *chip, int *val)
+ {
+ 	unsigned int charging_enabled;
+@@ -416,7 +606,7 @@ static int smb5_get_prop_charging_enabled(struct smb5_chip *chip, int *val)
+ 
+ static int smb5_get_prop_status(struct smb5_chip *chip, int *val)
+ {
+-	unsigned char stat[2];
++	unsigned int stat;
+ 	int usb_online = 0;
+ 	int rc;
+ 
+@@ -426,40 +616,33 @@ static int smb5_get_prop_status(struct smb5_chip *chip, int *val)
+ 		return rc;
+ 	}
+ 
+-	rc = regmap_bulk_read(chip->regmap,
+-			      chip->base + BATTERY_CHARGER_STATUS_1, &stat, 2);
++	rc = regmap_read(chip->regmap, chip->base + BATTERY_CHARGER_STATUS_1,
++			 &stat);
+ 	if (rc < 0) {
+ 		dev_err(chip->dev, "Failed to read charging status ret=%d\n",
+ 			rc);
+ 		return rc;
+ 	}
+ 
+-	if (stat[1] & VBATT_GTET_INHIBIT_BIT) {
+-		*val = POWER_SUPPLY_STATUS_NOT_CHARGING;
+-		return 0;
+-	}
+-
+-	stat[0] = stat[0] & BATTERY_CHARGER_STATUS_MASK;
+-
+-	switch (stat[0]) {
++	switch (stat & BATTERY_CHARGER_STATUS_MASK) {
+ 	case TRICKLE_CHARGE:
+ 	case PRE_CHARGE:
+-	case FAST_CHARGE:
+ 	case FULLON_CHARGE:
+ 	case TAPER_CHARGE:
+ 		*val = POWER_SUPPLY_STATUS_CHARGING;
+-		return rc;
+-	case DISABLE_CHARGE:
+-		*val = POWER_SUPPLY_STATUS_NOT_CHARGING;
+-		return rc;
++		break;
+ 	case TERMINATE_CHARGE:
+ 	case INHIBIT_CHARGE:
+ 		*val = POWER_SUPPLY_STATUS_FULL;
+-		return rc;
++		break;
++	case PAUSE_CHARGE:
++	case DISABLE_CHARGE:
+ 	default:
+-		*val = POWER_SUPPLY_STATUS_UNKNOWN;
+-		return rc;
++		*val = POWER_SUPPLY_STATUS_NOT_CHARGING;
++		break;
+ 	}
++
++	return 0;
+ }
+ 
+ static inline int smb5_get_current_limit(struct smb5_chip *chip,
+@@ -476,9 +659,10 @@ static int smb5_set_current_limit(struct smb5_chip *chip, unsigned int val)
+ {
+ 	unsigned char val_raw;
+ 
+-	if (val > 4950000) {
++	if (val > CURRENT_MAX_UA) {
+ 		dev_err(chip->dev,
+-			"Can't set current limit higher than 4950000uA");
++			"Can't set current limit higher than %duA",
++			CURRENT_MAX_UA);
+ 		return -EINVAL;
+ 	}
+ 	val_raw = val / CURRENT_SCALE_FACTOR;
+@@ -487,26 +671,139 @@ static int smb5_set_current_limit(struct smb5_chip *chip, unsigned int val)
+ 		val_raw);
+ }
+ 
++static int smb5_write_float_voltage(struct smb5_chip *chip, int uv)
++{
++	return regmap_write(chip->regmap, chip->base + FLOAT_VOLTAGE_CFG,
++			    (uv - FLOAT_VOLTAGE_MIN_UV) / FLOAT_VOLTAGE_STEP_UV);
++}
++
++static int smb5_read_float_voltage(struct smb5_chip *chip, int *uv)
++{
++	unsigned int raw;
++	int rc;
++
++	rc = regmap_read(chip->regmap, chip->base + FLOAT_VOLTAGE_CFG, &raw);
++	if (rc < 0)
++		return rc;
++
++	*uv = FLOAT_VOLTAGE_MIN_UV + raw * FLOAT_VOLTAGE_STEP_UV;
++
++	return 0;
++}
++
++static int smb5_write_charge_current(struct smb5_chip *chip, int ua)
++{
++	return regmap_write(chip->regmap, chip->base + FAST_CHARGE_CURRENT_CFG,
++			    ua / CURRENT_SCALE_FACTOR);
++}
++
++static int smb5_read_charge_current(struct smb5_chip *chip, int *ua)
++{
++	unsigned int raw;
++	int rc;
++
++	rc = regmap_read(chip->regmap, chip->base + FAST_CHARGE_CURRENT_CFG,
++			 &raw);
++	if (rc < 0)
++		return rc;
++
++	*ua = raw * CURRENT_SCALE_FACTOR;
++
++	return 0;
++}
++
++/*
++ * Program the charge limits of the current temperature zone and the charging
++ * enable, which is the sysfs request gated by the temperature.
++ * Must be called with chip->lock held.
++ */
++static int smb5_apply_limits(struct smb5_chip *chip)
++{
++	int fcc_ua = chip->fcc_max_ua;
++	int fv_uv = chip->fv_max_uv;
++	bool enable = chip->user_chg_en;
++	int rc;
++
++	/* Probe has not worked out the limits yet */
++	if (!fv_uv)
++		return -EAGAIN;
++
++	switch (chip->zone) {
++	case TEMP_NORMAL:
++		break;
++	case TEMP_COOL:
++		fcc_ua = min(fcc_ua, COOL_CHARGE_CURRENT_UA);
++		break;
++	case TEMP_WARM:
++		fv_uv = min(fv_uv, WARM_FLOAT_VOLTAGE_UV);
++		break;
++	case TEMP_COLD:
++	case TEMP_HOT:
++		enable = false;
++		fallthrough;
++	case TEMP_UNKNOWN:
++	default:
++		fcc_ua = min(fcc_ua, COOL_CHARGE_CURRENT_UA);
++		fv_uv = min(fv_uv, WARM_FLOAT_VOLTAGE_UV);
++		break;
++	}
++
++	if (!enable) {
++		rc = regmap_update_bits(chip->regmap,
++					chip->base + CHARGING_ENABLE_CMD,
++					CHARGING_ENABLE_CMD_BIT, 0);
++		if (rc < 0)
++			return rc;
++	}
++
++	rc = smb5_write_float_voltage(chip, fv_uv);
++	if (rc < 0)
++		return rc;
++
++	rc = smb5_write_charge_current(chip, fcc_ua);
++	if (rc < 0)
++		return rc;
++
++	if (enable)
++		rc = regmap_update_bits(chip->regmap,
++					chip->base + CHARGING_ENABLE_CMD,
++					CHARGING_ENABLE_CMD_BIT,
++					CHARGING_ENABLE_CMD_BIT);
++
++	return rc;
++}
++
+ static int smb5_set_prop_charging_enabled(struct smb5_chip *chip, unsigned int val)
+ {
+-	return regmap_update_bits(chip->regmap, chip->base + CHARGING_ENABLE_CMD,
+-					CHARGING_ENABLE_CMD_BIT, val ? CHARGING_ENABLE_CMD_BIT : 0);
++	int rc;
++
++	mutex_lock(&chip->lock);
++	chip->user_chg_en = !!val;
++	rc = smb5_apply_limits(chip);
++	mutex_unlock(&chip->lock);
++
++	return rc;
+ }
+ 
+ static void smb5_status_change_work(struct work_struct *work)
+ {
+-	union power_supply_propval typec_current, typec_online, typec_usb_type;
+-	unsigned int charger_type, current_ua;
+-	bool pd_online = false;
++	unsigned int apsd_result = 0, current_ua;
+ 	int usb_online = 0;
+ 	int count, rc;
+ 	struct smb5_chip *chip;
+ 
+ 	chip = container_of(work, struct smb5_chip, status_change_work.work);
+ 
++	/* A supplier event can arrive before registration has returned */
++	if (!chip->chg_psy)
++		return;
++
+ 	smb5_get_prop_usb_online(chip, &usb_online);
+-	if (!usb_online)
++	if (!usb_online) {
++		/* The next source starts from the lowest limit */
++		smb5_set_current_limit(chip, SDP_CURRENT_UA);
+ 		return;
++	}
+ 
+ 	/*
+ 	 * APSD is a BC1.2 detector and may still be running while TCPM has
+@@ -514,46 +811,18 @@ static void smb5_status_change_work(struct work_struct *work)
+ 	 * authoritative; waiting for or rerunning APSD only creates a race with
+ 	 * Type-C alternate-mode discovery and can temporarily apply an SDP ICL.
+ 	 */
+-	rc = power_supply_get_property_from_supplier(chip->chg_psy,
+-					POWER_SUPPLY_PROP_ONLINE,
+-					&typec_online);
+-	if (!rc && typec_online.intval) {
+-		rc = power_supply_get_property_from_supplier(chip->chg_psy,
+-						POWER_SUPPLY_PROP_USB_TYPE,
+-						&typec_usb_type);
+-		if (!rc) {
+-			switch (typec_usb_type.intval) {
+-			case POWER_SUPPLY_USB_TYPE_PD:
+-			case POWER_SUPPLY_USB_TYPE_PD_DRP:
+-			case POWER_SUPPLY_USB_TYPE_PD_PPS:
+-			case POWER_SUPPLY_USB_TYPE_PD_SPR_AVS:
+-			case POWER_SUPPLY_USB_TYPE_PD_PPS_SPR_AVS:
+-				pd_online = true;
+-				break;
+-			default:
+-				break;
+-			}
+-		}
+-	}
+-
+-	if (pd_online) {
+-		rc = power_supply_get_property_from_supplier(chip->chg_psy,
+-						POWER_SUPPLY_PROP_CURRENT_MAX,
+-						&typec_current);
+-		if (!rc && typec_current.intval > 0) {
+-			current_ua = min_t(unsigned int, typec_current.intval,
+-					   CURRENT_MAX_UA);
+-			goto set_current_limit;
+-		}
++	if (smb5_pd_current(chip, &current_ua))
++		goto set_current_limit;
+ 
+-		/* Do not fall back to an unverified BC1.2 high-current result. */
+-		current_ua = SDP_CURRENT_UA;
++	/* A 1.5 A or 3 A Type-C source may be loaded that far whatever BC1.2 says */
++	current_ua = smb5_typec_rp_current(chip);
++	if (current_ua)
+ 		goto set_current_limit;
+-	}
+ 
++	/* Default Type-C current (e.g. an A-to-C cable): BC1.2 decides */
+ 	for (count = 0; count < 3; count++) {
+ 		dev_dbg(chip->dev, "get charger type retry %d\n", count);
+-		rc = smb5_apsd_get_charger_type(chip, &charger_type);
++		rc = smb5_apsd_get_result(chip, &apsd_result);
+ 		if (rc != -EAGAIN)
+ 			break;
+ 		msleep(100);
+@@ -565,6 +834,7 @@ static void smb5_status_change_work(struct work_struct *work)
+ 	}
+ 
+ 	if (rc < 0) {
++		smb5_set_current_limit(chip, SDP_CURRENT_UA);
+ 		rc = regmap_update_bits(chip->regmap, chip->base + CMD_APSD,
+ 					APSD_RERUN_BIT, APSD_RERUN_BIT);
+ 		schedule_delayed_work(&chip->status_change_work,
+@@ -573,56 +843,221 @@ static void smb5_status_change_work(struct work_struct *work)
+ 		return;
+ 	}
+ 
+-	switch (charger_type) {
+-	case POWER_SUPPLY_USB_TYPE_CDP:
+-		current_ua = CDP_CURRENT_UA;
++	current_ua = smb5_apsd_to_current(apsd_result);
++
++set_current_limit:
++	dev_dbg(chip->dev, "input current limit %u uA\n", current_ua);
++	smb5_set_current_limit(chip, current_ua);
++	power_supply_changed(chip->chg_psy);
++}
++
++/* The Type-C current advertisement or the PD contract changed */
++static void smb5_external_power_changed(struct power_supply *psy)
++{
++	struct smb5_chip *chip = power_supply_get_drvdata(psy);
++
++	mod_delayed_work(system_wq, &chip->status_change_work,
++			 msecs_to_jiffies(100));
++}
++
++struct smb5_temp_request {
++	struct smb5_chip *chip;
++	int temp;
++};
++
++/* Use the temperature of the battery (gauge) this charger supplies */
++static int smb5_read_supplied_battery_temp(struct power_supply *psy, void *data)
++{
++	struct smb5_temp_request *req = data;
++	union power_supply_propval val;
++	size_t i;
++
++	if (psy == req->chip->chg_psy ||
++	    psy->desc->type != POWER_SUPPLY_TYPE_BATTERY || !psy->supplied_from)
++		return 0;
++
++	for (i = 0; i < psy->num_supplies; i++)
++		if (!strcmp(psy->supplied_from[i],
++			    req->chip->chg_psy->desc->name))
++			break;
++	if (i == psy->num_supplies)
++		return 0;
++
++	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_TEMP, &val))
++		return 0;
++
++	req->temp = val.intval;
++
++	return 1;
++}
++
++static int smb5_get_battery_temp(struct smb5_chip *chip, int *temp)
++{
++	struct smb5_temp_request req = { .chip = chip };
++
++	if (power_supply_for_each_psy(&req, smb5_read_supplied_battery_temp) != 1)
++		return -ENODATA;
++
++	if (req.temp < TEMP_PLAUSIBLE_MIN || req.temp > TEMP_PLAUSIBLE_MAX)
++		return -ERANGE;
++
++	*temp = req.temp;
++
++	return 0;
++}
++
++static enum smb5_temp_zone smb5_temp_to_zone(struct smb5_chip *chip, int temp,
++					     enum smb5_temp_zone prev)
++{
++	int cold = chip->temp_cold, cool = chip->temp_cool;
++	int warm = chip->temp_warm, hot = chip->temp_hot;
++
++	/* Leaving a restricted zone takes TEMP_HYSTERESIS more than entering it */
++	switch (prev) {
++	case TEMP_COLD:
++		cold += TEMP_HYSTERESIS;
++		fallthrough;
++	case TEMP_COOL:
++		cool += TEMP_HYSTERESIS;
+ 		break;
+-	case POWER_SUPPLY_USB_TYPE_DCP:
+-		current_ua = DCP_CURRENT_UA;
++	case TEMP_HOT:
++		hot -= TEMP_HYSTERESIS;
++		fallthrough;
++	case TEMP_WARM:
++		warm -= TEMP_HYSTERESIS;
+ 		break;
+-	case POWER_SUPPLY_USB_TYPE_SDP:
+ 	default:
+-		current_ua = SDP_CURRENT_UA;
+ 		break;
+ 	}
+ 
+-	/* Never exceed the current advertised by the Type-C source. */
+-	rc = power_supply_get_property_from_supplier(chip->chg_psy,
+-					POWER_SUPPLY_PROP_ONLINE,
+-					&typec_online);
+-	if (!rc && typec_online.intval) {
+-		rc = power_supply_get_property_from_supplier(chip->chg_psy,
+-						POWER_SUPPLY_PROP_CURRENT_MAX,
+-						&typec_current);
+-		if (!rc && typec_current.intval > 0)
+-			current_ua = min(current_ua,
+-					 (unsigned int)typec_current.intval);
+-	}
++	if (temp < cold)
++		return TEMP_COLD;
++	if (temp > hot)
++		return TEMP_HOT;
++	if (temp <= cool)
++		return TEMP_COOL;
++	if (temp > warm)
++		return TEMP_WARM;
+ 
+-set_current_limit:
+-	smb5_set_current_limit(chip, current_ua);
+-	power_supply_changed(chip->chg_psy);
++	return TEMP_NORMAL;
+ }
+ 
+-static int smb5_get_iio_chan(struct smb5_chip *chip, struct iio_channel *chan,
+-			     int *val)
++/* Must be called with chip->lock held */
++static void smb5_set_zone(struct smb5_chip *chip, enum smb5_temp_zone zone,
++			  int temp)
+ {
+ 	int rc;
+-	union power_supply_propval status;
+ 
+-	rc = power_supply_get_property(chip->chg_psy, POWER_SUPPLY_PROP_STATUS,
+-				       &status);
+-	if (rc < 0 || status.intval != POWER_SUPPLY_STATUS_CHARGING) {
++	if (zone == chip->zone)
++		return;
++
++	if (zone == TEMP_UNKNOWN)
++		dev_dbg(chip->dev, "battery temperature unknown, was %s\n",
++			smb5_temp_zone_names[chip->zone]);
++	else if (zone == TEMP_NORMAL && chip->zone == TEMP_UNKNOWN)
++		dev_dbg(chip->dev, "battery %d.%d degC: normal\n", temp / 10,
++			abs(temp % 10));
++	else
++		dev_info(chip->dev, "battery %d.%d degC: %s -> %s\n", temp / 10,
++			 abs(temp % 10), smb5_temp_zone_names[chip->zone],
++			 smb5_temp_zone_names[zone]);
++
++	chip->zone = zone;
++	rc = smb5_apply_limits(chip);
++	if (rc < 0)
++		dev_err(chip->dev, "Couldn't apply charge limits rc=%d\n", rc);
++}
++
++static void smb5_thermal_work(struct work_struct *work)
++{
++	struct smb5_chip *chip =
++		container_of(work, struct smb5_chip, thermal_work.work);
++	enum smb5_temp_zone prev, zone;
++	int usb_online = 0, temp = 0;
++	int rc = 0;
++
++	if (!chip->chg_psy)
++		return;
++
++	smb5_get_prop_usb_online(chip, &usb_online);
++	if (usb_online)
++		rc = smb5_get_battery_temp(chip, &temp);
++
++	mutex_lock(&chip->lock);
++
++	prev = chip->zone;
++
++	if (chip->asleep) {
++		mutex_unlock(&chip->lock);
++		return;
++	}
++
++	if (!usb_online) {
++		/*
++		 * Nothing to protect and nothing to poll for. The next attach
++		 * starts from the restricted limits until a temperature is
++		 * read.
++		 */
++		chip->temp_fails = 0;
++		smb5_set_zone(chip, TEMP_UNKNOWN, 0);
++		mutex_unlock(&chip->lock);
++		return;
++	}
++
++	if (rc < 0) {
++		/* Ride out a few failed reads before giving up on the zone */
++		if (prev != TEMP_UNKNOWN &&
++		    ++chip->temp_fails < THERMAL_READ_RETRIES) {
++			zone = prev;
++		} else {
++			zone = TEMP_UNKNOWN;
++			if (prev != TEMP_UNKNOWN)
++				dev_warn(chip->dev,
++					 "no battery temperature (%d), restricting charging\n",
++					 rc);
++		}
++	} else {
++		chip->temp_fails = 0;
++		zone = smb5_temp_to_zone(chip, temp, prev);
++	}
++
++	smb5_set_zone(chip, zone, temp);
++
++	mutex_unlock(&chip->lock);
++
++	if (zone != prev)
++		power_supply_changed(chip->chg_psy);
++
++	schedule_delayed_work(&chip->thermal_work,
++			      msecs_to_jiffies(THERMAL_POLL_MS));
++}
++
++static int smb5_get_usbin_voltage(struct smb5_chip *chip, int *val)
++{
++	int rc = iio_read_channel_processed(chip->usb_in_v_chan, val);
++
++	return rc < 0 ? rc : 0;
++}
++
++/* Input current drawn from the USB source */
++static int smb5_get_usbin_current(struct smb5_chip *chip, int *val)
++{
++	int usb_online = 0;
++	int rc, uv;
++
++	smb5_get_prop_usb_online(chip, &usb_online);
++	if (!usb_online) {
+ 		*val = 0;
+ 		return 0;
+ 	}
+ 
+-	if (IS_ERR(chan)) {
+-		dev_err(chip->dev, "Failed to chan, err = %li", PTR_ERR(chan));
+-		return PTR_ERR(chan);
+-	}
++	rc = iio_read_channel_processed(chip->usb_in_i_chan, &uv);
++	if (rc < 0)
++		return rc;
++
++	*val = USBIN_I_UV_TO_UA(uv);
+ 
+-	return iio_read_channel_processed(chan, val);
++	return 0;
+ }
+ 
+ static int smb5_get_prop_health(struct smb5_chip *chip, int *val)
+@@ -638,9 +1073,29 @@ static int smb5_get_prop_health(struct smb5_chip *chip, int *val)
+ 	}
+ 
+ 	if (stat & CHARGER_ERROR_STATUS_BAT_OV_BIT) {
+-		dev_err(chip->dev, "battery over-voltage");
++		*val = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
++		return 0;
+ 	}
+ 
++	/* The software zone follows the gauge and decides the charge limits */
++	switch (READ_ONCE(chip->zone)) {
++	case TEMP_COLD:
++		*val = POWER_SUPPLY_HEALTH_COLD;
++		return 0;
++	case TEMP_COOL:
++		*val = POWER_SUPPLY_HEALTH_COOL;
++		return 0;
++	case TEMP_WARM:
++		*val = POWER_SUPPLY_HEALTH_WARM;
++		return 0;
++	case TEMP_HOT:
++		*val = POWER_SUPPLY_HEALTH_OVERHEAT;
++		return 0;
++	default:
++		break;
++	}
++
++	/* Otherwise report what the PMIC's own JEITA comparators see */
+ 	rc = regmap_read(chip->regmap, chip->base + BATTERY_CHARGER_STATUS_7_REG,
+ 			 &stat);
+ 	if (rc < 0) {
+@@ -678,11 +1133,9 @@ static int smb5_get_property(struct power_supply *psy,
+ 	case POWER_SUPPLY_PROP_CURRENT_MAX:
+ 		return smb5_get_current_limit(chip, &val->intval);
+ 	case POWER_SUPPLY_PROP_CURRENT_NOW:
+-		return smb5_get_iio_chan(chip, chip->usb_in_i_chan,
+-					 &val->intval);
++		return smb5_get_usbin_current(chip, &val->intval);
+ 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+-		return smb5_get_iio_chan(chip, chip->usb_in_v_chan,
+-					 &val->intval);
++		return smb5_get_usbin_voltage(chip, &val->intval);
+ 	case POWER_SUPPLY_PROP_ONLINE:
+ 		return smb5_get_prop_usb_online(chip, &val->intval);
+ 	case POWER_SUPPLY_PROP_STATUS:
+@@ -693,6 +1146,10 @@ static int smb5_get_property(struct power_supply *psy,
+ 		return smb5_apsd_get_charger_type(chip, &val->intval);
+ 	case POWER_SUPPLY_PROP_CHARGING_ENABLED:
+ 		return smb5_get_prop_charging_enabled(chip, &val->intval);
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
++		return smb5_read_charge_current(chip, &val->intval);
++	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE:
++		return smb5_read_float_voltage(chip, &val->intval);
+ 	default:
+ 		dev_err(chip->dev, "invalid property: %d\n", psp);
+ 		return -EINVAL;
+@@ -753,6 +1210,7 @@ static irqreturn_t smb5_handle_usb_plugin(int irq, void *data)
+ 
+ 	schedule_delayed_work(&chip->status_change_work,
+ 			      msecs_to_jiffies(1500));
++	mod_delayed_work(system_wq, &chip->thermal_work, 0);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -793,6 +1251,7 @@ static const struct power_supply_desc smb5_psy_desc = {
+ 	.get_property = smb5_get_property,
+ 	.set_property = smb5_set_property,
+ 	.property_is_writeable = smb5_property_is_writable,
++	.external_power_changed = smb5_external_power_changed,
+ };
+ 
+ /* Init sequence derived from vendor downstream driver */
+@@ -808,24 +1267,25 @@ static const struct smb5_register smb5_init_seq[] = {
+ 	{ .addr = CHARGE_RCHG_SOC_THRESHOLD_CFG_REG,
+ 	  .mask = CHARGE_RCHG_SOC_THRESHOLD_CFG_MASK,
+ 	  .val = 98 },
+-	/* Enable charging */
+-	{ .addr = CHARGING_ENABLE_CMD,
+-	  .mask = CHARGING_ENABLE_CMD_BIT,
+-	  .val = CHARGING_ENABLE_CMD_BIT },
+ 	/* Enable BC1P2 Src detect */
+ 	{ .addr = USBIN_OPTIONS_1_CFG,
+ 	  .mask = BC1P2_SRC_DETECT_BIT,
+ 	  .val = BC1P2_SRC_DETECT_BIT },
+-	/* Select the 900 mA SuperSpeed SDP current configured above. */
++	/*
++	 * Software controlled input current limit, the vendor
++	 * SW_OVERRIDE_HC_MODE: USBIN_CURRENT_LIMIT_CFG applies once APSD is
++	 * done, whatever its result. Should the hardware still pick the
++	 * USB 5/1 options, they select 500 mA (USB 2.0).
++	 */
+ 	{ .addr = USBIN_ICL_OPTIONS,
+-	  .mask = CFG_USB3P0_SEL_BIT | USBIN_MODE_CHG_BIT,
+-	  .val = CFG_USB3P0_SEL_BIT | USBIN_MODE_CHG_BIT },
++	  .mask = CFG_USB3P0_SEL_BIT | USB51_MODE_BIT | USBIN_MODE_CHG_BIT,
++	  .val = USB51_MODE_BIT | USBIN_MODE_CHG_BIT },
+ 	{ .addr = CMD_ICL_OVERRIDE,
+ 	  .mask = ICL_OVERRIDE_BIT,
+ 	  .val = 0 },
+ 	{ .addr = USBIN_LOAD_CFG,
+ 	  .mask = ICL_OVERRIDE_AFTER_APSD_BIT,
+-	  .val = 0 },
++	  .val = ICL_OVERRIDE_AFTER_APSD_BIT },
+ 	/* Disable watchdog */
+ 	{ .addr = SNARL_BARK_BITE_WD_CFG, .mask = 0xff, .val = 0 },
+ 	{ .addr = WD_CFG,
+@@ -865,6 +1325,7 @@ static int smb5_init_hw(struct smb5_chip *chip)
+ static int smb5_init_battery_limits(struct smb5_chip *chip)
+ {
+ 	struct power_supply_battery_info *info = chip->batt_info;
++	u8 buf[2];
+ 	int rc;
+ 
+ 	/*
+@@ -874,18 +1335,17 @@ static int smb5_init_battery_limits(struct smb5_chip *chip)
+ 	if (info->voltage_max_design_uv <= 0) {
+ 		dev_warn(chip->dev,
+ 			 "no voltage-max-design-microvolt, float voltage left unchanged\n");
++		rc = smb5_read_float_voltage(chip, &chip->fv_max_uv);
++		if (rc < 0)
++			return dev_err_probe(chip->dev, rc,
++					     "Couldn't read vbat max\n");
+ 	} else if (info->voltage_max_design_uv < FLOAT_VOLTAGE_MIN_UV ||
+ 		   info->voltage_max_design_uv > FLOAT_VOLTAGE_MAX_UV) {
+ 		return dev_err_probe(chip->dev, -EINVAL,
+ 				     "float voltage %d uV out of range\n",
+ 				     info->voltage_max_design_uv);
+ 	} else {
+-		rc = regmap_write(chip->regmap, chip->base + FLOAT_VOLTAGE_CFG,
+-				  (info->voltage_max_design_uv -
+-				   FLOAT_VOLTAGE_MIN_UV) / FLOAT_VOLTAGE_STEP_UV);
+-		if (rc < 0)
+-			return dev_err_probe(chip->dev, rc,
+-					     "Couldn't set vbat max\n");
++		chip->fv_max_uv = info->voltage_max_design_uv;
+ 	}
+ 
+ 	/* Optional cap on the battery (fast) charge current */
+@@ -896,15 +1356,102 @@ static int smb5_init_battery_limits(struct smb5_chip *chip)
+ 					     "charge current %d uA out of range\n",
+ 					     info->constant_charge_current_max_ua);
+ 
+-		rc = regmap_write(chip->regmap,
+-				  chip->base + FAST_CHARGE_CURRENT_CFG,
+-				  info->constant_charge_current_max_ua /
+-				  CURRENT_SCALE_FACTOR);
++		chip->fcc_max_ua = info->constant_charge_current_max_ua;
++	} else {
++		rc = smb5_read_charge_current(chip, &chip->fcc_max_ua);
++		if (rc < 0)
++			return dev_err_probe(chip->dev, rc,
++					     "Couldn't read charge current\n");
++	}
++
++	/*
++	 * Temperature window in tenths of a degree. Fall back to the vendor
++	 * values unless the battery node gives a complete, ordered set.
++	 */
++	chip->temp_cold = TEMP_COLD_DEFAULT;
++	chip->temp_cool = TEMP_COOL_DEFAULT;
++	chip->temp_warm = TEMP_WARM_DEFAULT;
++	chip->temp_hot = TEMP_HOT_DEFAULT;
++	if (info->temp_min > -100 && info->temp_max < 100 &&
++	    info->temp_min < info->temp_alert_min &&
++	    info->temp_alert_min + 2 * TEMP_HYSTERESIS / 10 < info->temp_alert_max &&
++	    info->temp_alert_max < info->temp_max) {
++		chip->temp_cold = info->temp_min * 10;
++		chip->temp_cool = info->temp_alert_min * 10;
++		chip->temp_warm = info->temp_alert_max * 10;
++		chip->temp_hot = info->temp_max * 10;
++	}
++
++	/*
++	 * Termination current, compared by the charger ADC once the float
++	 * voltage is reached (vendor qcom,chg-term-src = 1,
++	 * qcom,chg-term-current-ma). Left at the PMIC default when the battery
++	 * node does not give one.
++	 */
++	if (info->charge_term_current_ua > 0) {
++		s16 raw;
++
++		if (info->charge_term_current_ua > ITERM_LIMIT_UA)
++			return dev_err_probe(chip->dev, -EINVAL,
++					     "termination current %d uA out of range\n",
++					     info->charge_term_current_ua);
++
++		raw = -div_s64((s64)info->charge_term_current_ua *
++			       ITERM_ADC_FULL_SCALE, ITERM_LIMIT_UA);
++		put_unaligned_be16(raw, buf);
++		rc = regmap_bulk_write(chip->regmap,
++				       chip->base + CHGR_ADC_ITERM_UP_THD_MSB,
++				       buf, sizeof(buf));
++		if (!rc)
++			rc = regmap_update_bits(chip->regmap,
++						chip->base + CHGR_CFG2,
++						CHARGER_EN_ITERM_BIT,
++						CHARGER_EN_ITERM_BIT);
++		if (rc < 0)
++			return dev_err_probe(chip->dev, rc,
++					     "Couldn't set termination current\n");
++	}
++
++	/*
++	 * Recharge when the battery falls back to this voltage after
++	 * termination (vendor qcom,auto-recharge-vbat-mv, three samples).
++	 */
++	if (info->charge_restart_voltage_uv > 0) {
++		if (info->charge_restart_voltage_uv >= chip->fv_max_uv)
++			return dev_err_probe(chip->dev, -EINVAL,
++					     "recharge voltage %d uV not below the float voltage\n",
++					     info->charge_restart_voltage_uv);
++
++		put_unaligned_be16(div_u64((u64)info->charge_restart_voltage_uv *
++					   1000, RECHG_ADC_LSB_NV), buf);
++		rc = regmap_bulk_write(chip->regmap,
++				       chip->base + CHGR_ADC_RECHARGE_THRESHOLD_MSB,
++				       buf, sizeof(buf));
++		if (!rc)
++			rc = regmap_update_bits(chip->regmap,
++						chip->base + CHGR_NO_SAMPLE_TERM_RCHG_CFG,
++						NO_OF_SAMPLE_FOR_RCHG_MASK,
++						FIELD_PREP(NO_OF_SAMPLE_FOR_RCHG_MASK, 2));
++		if (!rc)
++			rc = regmap_update_bits(chip->regmap,
++						chip->base + CHGR_CFG2,
++						RECHG_MASK, VBAT_BASED_RECHG_BIT);
+ 		if (rc < 0)
+ 			return dev_err_probe(chip->dev, rc,
+-					     "Couldn't set charge current\n");
++					     "Couldn't set recharge voltage\n");
+ 	}
+ 
++	/*
++	 * Start from the restricted limits; the temperature poll lifts them
++	 * as soon as the gauge answers. This also enables charging.
++	 */
++	mutex_lock(&chip->lock);
++	rc = smb5_apply_limits(chip);
++	mutex_unlock(&chip->lock);
++	if (rc < 0)
++		return dev_err_probe(chip->dev, rc,
++				     "Couldn't set charge limits\n");
++
+ 	return 0;
+ }
+ 
+@@ -969,6 +1516,29 @@ static int smb5_probe(struct platform_device *pdev)
+ 	if (rc < 0)
+ 		return rc;
+ 
++	/*
++	 * The works can be kicked by the supplier (external_power_changed)
++	 * as soon as the power supply is registered, so set them up first.
++	 */
++	chip->zone = TEMP_UNKNOWN;
++	chip->user_chg_en = true;
++
++	rc = devm_mutex_init(chip->dev, &chip->lock);
++	if (rc)
++		return rc;
++
++	rc = devm_delayed_work_autocancel(chip->dev, &chip->status_change_work,
++					  smb5_status_change_work);
++	if (rc)
++		return dev_err_probe(chip->dev, rc,
++				     "Failed to init status change work\n");
++
++	rc = devm_delayed_work_autocancel(chip->dev, &chip->thermal_work,
++					  smb5_thermal_work);
++	if (rc)
++		return dev_err_probe(chip->dev, rc,
++				     "Failed to init thermal work\n");
++
+ 	supply_config.drv_data = chip;
+ 	supply_config.fwnode = pdev->dev.fwnode;
+ 
+@@ -993,12 +1563,6 @@ static int smb5_probe(struct platform_device *pdev)
+ 		return dev_err_probe(chip->dev, rc,
+ 				     "Failed to get battery info\n");
+ 
+-	rc = devm_delayed_work_autocancel(chip->dev, &chip->status_change_work,
+-					  smb5_status_change_work);
+-	if (rc)
+-		return dev_err_probe(chip->dev, rc,
+-				     "Failed to init status change work\n");
+-
+ 	rc = smb5_init_battery_limits(chip);
+ 	if (rc < 0)
+ 		return rc;
+@@ -1028,10 +1592,58 @@ static int smb5_probe(struct platform_device *pdev)
+ 
+ 	/* Initialise charger state */
+ 	schedule_delayed_work(&chip->status_change_work, 0);
++	schedule_delayed_work(&chip->thermal_work, 0);
+ 
+ 	return 0;
+ }
+ 
++/*
++ * Nothing watches the battery temperature while the system sleeps or after
++ * it has shut down, but the PMIC keeps charging. Leave it with the restricted
++ * limits, or with charging off if the battery was already too cold or too hot.
++ */
++static void smb5_stop_monitoring(struct smb5_chip *chip)
++{
++	mutex_lock(&chip->lock);
++	chip->asleep = true;
++	mutex_unlock(&chip->lock);
++
++	cancel_delayed_work_sync(&chip->thermal_work);
++
++	mutex_lock(&chip->lock);
++	chip->temp_fails = 0;
++	if (chip->zone != TEMP_COLD && chip->zone != TEMP_HOT)
++		smb5_set_zone(chip, TEMP_UNKNOWN, 0);
++	mutex_unlock(&chip->lock);
++}
++
++static int smb5_suspend(struct device *dev)
++{
++	smb5_stop_monitoring(dev_get_drvdata(dev));
++
++	return 0;
++}
++
++static int smb5_resume(struct device *dev)
++{
++	struct smb5_chip *chip = dev_get_drvdata(dev);
++
++	mutex_lock(&chip->lock);
++	chip->asleep = false;
++	mutex_unlock(&chip->lock);
++
++	mod_delayed_work(system_wq, &chip->thermal_work, 0);
++
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(smb5_pm_ops, smb5_suspend, smb5_resume);
++
++static void smb5_shutdown(struct platform_device *pdev)
++{
++	smb5_stop_monitoring(platform_get_drvdata(pdev));
++}
++
+ static const struct of_device_id smb5_match_id_table[] = {
+ 	{ .compatible = "qcom,pm8150b-charger", .data = "pm8150b" },
+ 	{ /* sentinal */ }
+@@ -1040,9 +1652,11 @@ MODULE_DEVICE_TABLE(of, smb5_match_id_table);
+ 
+ static struct platform_driver qcom_spmi_smb5 = {
+ 	.probe = smb5_probe,
++	.shutdown = smb5_shutdown,
+ 	.driver = {
+ 		.name = "qcom-pm8150b-charger",
+ 		.of_match_table = smb5_match_id_table,
++		.pm = pm_sleep_ptr(&smb5_pm_ops),
+ 		},
+ };
+ 

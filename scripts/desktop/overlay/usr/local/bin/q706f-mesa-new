@@ -1,0 +1,12 @@
+#!/bin/sh
+# Run one program with the side-by-side Mesa 26.3.1 (freedreno + turnip) from /opt.
+# The desktop (mutter) and other apps keep the system Mesa. The manifests are read from the
+# library dir (WebKit's sandbox binds LD_LIBRARY_PATH entries, not /opt/.../share).
+M=/opt/mesa-26.3.1; L=$M/lib/aarch64-linux-gnu
+J=$L/manifests; [ -d "$J" ] || J=
+export LD_LIBRARY_PATH=$L${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export __EGL_VENDOR_LIBRARY_FILENAMES=${J:-$M/share/glvnd/egl_vendor.d}/50_mesa.json
+export __GLX_VENDOR_LIBRARY_NAME=mesa
+export GBM_BACKENDS_PATH=$L/gbm
+export VK_DRIVER_FILES=${J:-$M/share/vulkan/icd.d}/freedreno_icd.aarch64.json
+exec "$@"

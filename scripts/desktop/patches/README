@@ -85,8 +85,7 @@ B3af kernel that runs on boot_a/boot_b since 14.11.2026 (verified 16.11.2026 wit
 diff -r against the B3af source tree).
 
 Still pending (not applied by the build): 0112 (soundwire, not needed), 0115 (panel
-probe-time supply vote, untested), 0116 (USB-PD 9 V sink PDO + 4 A charging, 9 V not
-tested yet), 0117 (pm8150b Quick Charge 9 V request, QC path not exercised yet).
+probe-time supply vote, untested), 0116 (USB-PD 9 V sink PDO + 4 A charging; integrated 22.11.2026, 9 V tested), 0117 (pm8150b Quick Charge 9 V request, QC path not exercised yet).
 
 Evaluated and not applied
 -------------------------
@@ -123,7 +122,7 @@ Not applied
 -----------
 *.needs-approval files in this directory are proposals waiting for the owner's decision
 (they still apply cleanly on this tree). The former 7.1 series is kept for reference in
-../patches-7.1/ (0013 there is superseded by 0201 here).
+the older, unpublished 7.1 series (0013 there is superseded by 0201 here).
 
 0121-wifi-ath11k-pci-unbind-across-system-suspend.patch  (integrated 20.11.2026)
     Module parameter ath11k_pci.unbind_in_suspend (default off; on in
@@ -144,3 +143,35 @@ Other files:
     0122 *.pending    s5k5e9: propagate I2C errors, start at 1x gain (optional)
     0124 *.pending    cs35l45: minimum time in hibernation before wake (no effect alone)
     0899 *.debug      debug-only (PCIe controller kept off)
+
+0125-asoc-cs35l45-pause-firmware-before-global-disable.patch  (integrated 20.11.2026)
+    Send PAUSE to the speaker-protection firmware before GLOBAL_EN is cleared. The firmware
+    runs whenever the amp is enabled, also on the ASP_RX bypass route where the DSP widget
+    (and so PAUSE) is not in the path; left running when the PLL loses BCLK, it tripped the
+    DSP watchdog on all four amps a few seconds after PipeWire's first streams at every boot.
+    0 watchdogs in 3 boots with repeated streams (module-only test, kernel 23f5fdad).
+    0126 *.pending    sm8250: speaker TDM rate parameter (48/96 kHz), experiment; 96 kHz did not
+                      make the protection firmware process
+
+0127-i2c-qcom-cci-reset-on-power-up-and-retry-on-timeout.patch  (integrated 20.11.2026)
+    CCI controller reset on runtime resume, per-master reset and -EAGAIN retry on a queue timeout:
+    the camera sensors no longer fail their first probe ("queue 0 timeout" -> -EIO). Module test,
+    3 boots without q706f-camera-retry: 3/3 sensors bound each time.
+
+0138-pm8150b-charger-pin-buck-switching-frequency.patch  (integrated 22.11.2026)
+    Writes DCDC_FSW_SEL = 0x08 (1050 kHz, vendor freq_9V) at probe. The bootloader already
+    leaves 0x08 (read back on 22.11), so nothing changes at 5 V; it is the prerequisite for
+    the 9 V sink PDO in 0116 (refreshed on top of 0138).
+
+Q706F s2idle low-power switches (integrated 22.11.2026)
+------------------------------------------------------
+0130–0137 add runtime switches that all default off; q706f-lpm.service (overlay,
+/etc/default/q706f-lpm) turns them on at boot. Tested together on 22.11.2026: a
+30-min s2idle run left the gauge unchanged vs 47.9 mA with all off. The CTN730
+delta (0133) is merged into ../modules/ctn730/ctn730.c. 0134 (AS33970) has no
+effect while the AS33970 is unbound. Original notes:
+0130–0137 were optional patches for a single A/B test build on top of the full
+current series. All new runtime switches default off. 0135 carries the 0115
+probe-vote handoff. 0133 enables the board opt-in for the alternate CTN730
+module (a debug build, not published here). The switches are listed in
+/etc/default/q706f-lpm (overlay).

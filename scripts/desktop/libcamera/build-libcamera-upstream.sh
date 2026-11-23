@@ -42,8 +42,12 @@ SHORT=$(git -C "$OUT/src" rev-parse --short=12 HEAD)
 echo "== libcamera $(git -C "$OUT/src" describe --tags --always) ($SHORT)"
 
 if ! git -C "$OUT/src" log --oneline -F --grep="Set vblank on more platforms" | grep -q .; then
-  echo "!! $REV does not contain the VBLANK series (patchwork 28841); refusing" >&2
-  exit 1
+  if [ "${ALLOW_NO_VBLANK:-0}" = 1 ]; then
+    echo "== $REV has no VBLANK series (patchwork 28841): building anyway (ALLOW_NO_VBLANK=1)"
+  else
+    echo "!! $REV does not contain the VBLANK series (patchwork 28841); refusing (ALLOW_NO_VBLANK=1 to override)" >&2
+    exit 1
+  fi
 fi
 
 # Local sensor helpers (prints the resulting diff for review).

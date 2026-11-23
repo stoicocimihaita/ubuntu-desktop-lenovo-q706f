@@ -1,0 +1,34 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] q706f: dts: disable the QCE node (no driver; blocks interconnect sync_state)
+
+CONFIG_CRYPTO_DEV_QCE is not set, so crypto@1dfa000 never binds:
+  qnoc-sm8250 163d000.interconnect: sync_state() pending due to 1dfa000.crypto
+  qnoc-sm8250 1700000.interconnect: sync_state() pending due to 1dfa000.crypto
+icc_sync_state() only drops the boot votes once every provider is synced,
+so all interconnect nodes keep avg/peak = INT_MAX in every RPMh bucket
+(interconnect_summary shows 2147483647 on each node). The buses and the DDR
+stay at their top corner in s2idle as well: qcom_stats cxsd/aosd/ddr = 0.
+
+The alternative is to build the driver (CONFIG_CRYPTO_DEV_QCE=m); it is not
+needed here (ARMv8 CE is faster) and it registers extra crypto algorithms.
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+index cc6abe92b7de004fbfa030cfbfd10224a3556735..4855787d0a102922be7f3bc41e8fc5e7623a8247 100644
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+@@ -823,8 +823,14 @@ opp-3187200000 {
+ 	};
+ };
+ 
++/*
++ * No QCE driver is built (CONFIG_CRYPTO_DEV_QCE is not set). An enabled node
++ * without a driver keeps the aggre2_noc and mc_virt interconnect providers
++ * from ever reaching sync_state(), which leaves every interconnect node at
++ * its INT_MAX boot vote, in the RPMh sleep set too (no CX collapse in s2idle).
++ */
+ &crypto {
+-	status = "okay";
++	status = "disabled";
+ };
+ 
+ &gmu {

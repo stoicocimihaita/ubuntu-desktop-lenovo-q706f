@@ -1,0 +1,248 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] ASoC: as33970: gate idle Q706F DSP supplies in s2idle
+
+Preserve both always-on constraints and the boot-time power sequence.
+When the DSP is in its ROM loader, optionally hold reset and gate its
+two opted-in rails after ordinary device suspend. Restore the rails
+and reset sequence before ordinary device resume.
+
+---
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+@@ -218,6 +218,7 @@
+ 		regulator-max-microvolt = <1300000>;
+ 		gpio = <&tlmm 61 GPIO_ACTIVE_HIGH>;
+ 		enable-active-high;
++		qcom,q706f-allow-audio-sleep-gate;
+ 		regulator-boot-on;
+ 		regulator-always-on;
+ 	};
+@@ -686,6 +687,7 @@
+ 
+ 		vreg_l13a_3p0: ldo13 {
+ 			regulator-name = "vreg_l13a_3p0";
++			qcom,q706f-allow-audio-sleep-gate;
+ 			regulator-min-microvolt = <3008000>;
+ 			regulator-max-microvolt = <3008000>;
+ 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+--- a/include/linux/regulator/consumer.h
++++ b/include/linux/regulator/consumer.h
+@@ -194,6 +194,7 @@
+ /* regulator output control and status */
+ int __must_check regulator_enable(struct regulator *regulator);
+ int regulator_disable(struct regulator *regulator);
++int regulator_q706f_audio_sleep_gate(struct regulator *regulator, bool gate);
+ int regulator_force_disable(struct regulator *regulator);
+ int regulator_is_enabled(struct regulator *regulator);
+ int regulator_disable_deferred(struct regulator *regulator, int ms);
+@@ -415,6 +416,12 @@
+ 	return 0;
+ }
+ 
++static inline int regulator_q706f_audio_sleep_gate(struct regulator *regulator,
++						   bool gate)
++{
++	return -EOPNOTSUPP;
++}
++
+ static inline int regulator_disable(struct regulator *regulator)
+ {
+ 	return 0;
+--- a/drivers/regulator/core.c
++++ b/drivers/regulator/core.c
+@@ -3252,6 +3252,35 @@
+ 	return 0;
+ }
+ 
++/*
++ * Q706F needs these two rails powered before the audio bus probes. Permit
++ * their named consumer to gate them during system PM with one boot vote
++ * and one consumer vote. Retain all logical votes and the upstream supply.
++ */
++int regulator_q706f_audio_sleep_gate(struct regulator *regulator, bool gate)
++{
++	struct regulator_dev *rdev = regulator->rdev;
++	int ret;
++
++	if (!of_property_read_bool(rdev->dev.of_node,
++				   "qcom,q706f-allow-audio-sleep-gate"))
++		return -EOPNOTSUPP;
++
++	regulator_lock(rdev);
++	if (!gate)
++		ret = _regulator_do_enable(rdev);
++	else if (!rdev->constraints->always_on || rdev->use_count != 2 ||
++		 regulator->enable_count != 1 ||
++		 (rdev->ena_pin && rdev->ena_pin->enable_count != 1))
++		ret = -EBUSY;
++	else
++		ret = _regulator_do_disable(rdev);
++	regulator_unlock(rdev);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(regulator_q706f_audio_sleep_gate);
++
+ /* locks held by regulator_disable() */
+ static int _regulator_disable(struct regulator *regulator)
+ {
+--- a/sound/soc/codecs/as33970.c
++++ b/sound/soc/codecs/as33970.c
+@@ -6,6 +6,8 @@
+ #include <linux/i2c.h>
+ #include <linux/jiffies.h>
+ #include <linux/module.h>
++#include <linux/of.h>
++#include <linux/suspend.h>
+ #include <linux/regmap.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/unaligned.h>
+@@ -53,11 +55,23 @@
+ 	u32 data[AS33970_CMD_WORDS];
+ };
+ 
++enum as33970_supply {
++	AS33970_VBAT,
++	AS33970_AVDD13,
++	AS33970_NUM_SUPPLIES,
++};
++
++static bool suspend_power_off;
++module_param(suspend_power_off, bool, 0644);
++MODULE_PARM_DESC(suspend_power_off, "Q706F: release idle AS33970 supplies in s2idle");
++
+ struct as33970_priv {
+ 	struct device *dev;
+ 	struct regmap *regmap;
+ 	struct gpio_desc *reset;
+ 	struct mutex lock;
++	struct regulator_bulk_data supplies[AS33970_NUM_SUPPLIES];
++	unsigned long gated_supplies;
+ 	u32 rate;
+ 	u32 width;
+ 	u32 frame_bits;
+@@ -734,11 +748,83 @@
+ 	.name = "as33970",
+ };
+ 
++static int as33970_restore_supplies(struct as33970_priv *as33970)
++{
++	int i, ret;
++
++	for_each_set_bit(i, &as33970->gated_supplies, AS33970_NUM_SUPPLIES) {
++		ret = regulator_q706f_audio_sleep_gate(as33970->supplies[i].consumer,
++						      false);
++		if (ret)
++			return ret;
++		clear_bit(i, &as33970->gated_supplies);
++	}
++
++	msleep(50);
++	gpiod_set_value_cansleep(as33970->reset, 1);
++	msleep(100);
++	return 0;
++}
++
++static int as33970_resume_early(struct device *dev)
++{
++	struct as33970_priv *as33970 = dev_get_drvdata(dev);
++
++	guard(mutex)(&as33970->lock);
++	if (!as33970->gated_supplies)
++		return 0;
++	return as33970_restore_supplies(as33970);
++}
++
++static int as33970_suspend_late(struct device *dev)
++{
++	struct as33970_priv *as33970 = dev_get_drvdata(dev);
++	int i, ret, restore;
++
++	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE ||
++	    !of_machine_is_compatible("lenovo,q706f") ||
++	    !READ_ONCE(suspend_power_off) || !as33970->reset)
++		return 0;
++
++	guard(mutex)(&as33970->lock);
++	if (as33970->gated_supplies)
++		return -EIO;
++
++	/* The firmware is volatile. Preserve every running DSP. */
++	if (!as33970_in_rom_loader(as33970))
++		return 0;
++	as33970->fw_status = 0;
++
++	gpiod_set_value_cansleep(as33970->reset, 0);
++	for (i = AS33970_NUM_SUPPLIES - 1; i >= 0; i--) {
++		ret = regulator_q706f_audio_sleep_gate(as33970->supplies[i].consumer,
++						      true);
++		if (ret) {
++			restore = as33970_restore_supplies(as33970);
++			dev_warn(dev, "audio supply %s could not be gated: %d\n",
++				 as33970->supplies[i].supply, ret);
++			return restore ?: ret;
++		}
++		set_bit(i, &as33970->gated_supplies);
++	}
++	return 0;
++}
++
++static const struct dev_pm_ops as33970_pm_ops = {
++	.suspend_late = pm_sleep_ptr(as33970_suspend_late),
++	.resume_early = pm_sleep_ptr(as33970_resume_early),
++};
++
++static void as33970_disable_supplies(void *data)
++{
++	struct as33970_priv *as33970 = data;
++
++	as33970_resume_early(as33970->dev);
++	regulator_bulk_disable(ARRAY_SIZE(as33970->supplies), as33970->supplies);
++}
++
+ static int as33970_probe(struct i2c_client *client)
+ {
+-	static const char * const supplies[] = {
+-		"as33970-vbat", "as33970-avdd13"
+-	};
+ 	struct as33970_priv *as33970;
+ 	int ret;
+ 
+@@ -750,10 +836,19 @@
+ 	as33970->width = 1;
+ 	as33970->frame_bits = 32;
+ 	mutex_init(&as33970->lock);
+-	ret = devm_regulator_bulk_get_enable(&client->dev,
+-					     ARRAY_SIZE(supplies), supplies);
++	as33970->supplies[AS33970_VBAT].supply = "as33970-vbat";
++	as33970->supplies[AS33970_AVDD13].supply = "as33970-avdd13";
++	ret = devm_regulator_bulk_get(&client->dev, ARRAY_SIZE(as33970->supplies),
++				      as33970->supplies);
++	if (ret)
++		return dev_err_probe(&client->dev, ret, "failed to get supplies\n");
++	ret = regulator_bulk_enable(ARRAY_SIZE(as33970->supplies), as33970->supplies);
+ 	if (ret)
+ 		return dev_err_probe(&client->dev, ret, "failed to enable supplies\n");
++	i2c_set_clientdata(client, as33970);
++	ret = devm_add_action_or_reset(&client->dev, as33970_disable_supplies, as33970);
++	if (ret)
++		return ret;
+ 	as33970->reset = devm_gpiod_get_optional(&client->dev, "reset",
+ 						 GPIOD_OUT_LOW);
+ 	if (IS_ERR(as33970->reset))
+@@ -764,7 +859,6 @@
+ 	as33970->regmap = devm_regmap_init_i2c(client, &as33970_regmap_config);
+ 	if (IS_ERR(as33970->regmap))
+ 		return dev_err_probe(&client->dev, PTR_ERR(as33970->regmap), "regmap\n");
+-	i2c_set_clientdata(client, as33970);
+ 	ret = devm_device_add_group(&client->dev, &as33970_attr_group);
+ 	if (ret)
+ 		return ret;
+@@ -798,6 +892,7 @@
+ static struct i2c_driver as33970_driver = {
+ 	.driver = {
+ 		.name = "as33970",
++		.pm = pm_ptr(&as33970_pm_ops),
+ 		.of_match_table = as33970_of_match,
+ 	},
+ 	.probe = as33970_probe,

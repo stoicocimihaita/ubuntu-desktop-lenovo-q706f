@@ -53,7 +53,8 @@ build-ul curat nu mai ajunge).
 
 **Din `scripts/desktop/overlay/`** (copiat de `make-rootimg.sh`, totul `root:root`, fără drept de scriere pentru grup):
 - servicii de sistem activate: `q706f-bt-addr`, `q706f-pen-dock`, `q706f-tablet-mode`, `q706f-ssh-hostkeys`;
-  pornite din udev: `q706f-clock-restore` (regula `85-hwclock.rules`), `q706f-bt-addr` (`82-…`), `q706f-wifi-addr` și
+  ceasul: `fake-hwclock-load/-save` cu drop-in-urile `60-q706f.conf` și `q706f-clock-checkpoint` (doar înainte);
+  pornite din udev: `q706f-bt-addr` (`82-…`), `q706f-wifi-addr` și
   `q706f-regdom` (`83-q706f-wifi.rules`);
 - servicii de utilizator activate (`graphical-session.target`): `q706f-screen-keys`, `q706f-audio-settle`;
 - logind (`10-q706f-tablet.conf`), suspendare (`10-q706f-suspend.conf`, `AllowSuspend=yes`), hook-ul `system-sleep/q706f-sleep`;

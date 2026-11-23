@@ -1,0 +1,11 @@
+[Unit]
+Description=q706f low-power switches for suspend (0130-0137)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/q706f-lpm-apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

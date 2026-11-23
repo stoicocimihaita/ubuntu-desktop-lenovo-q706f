@@ -1,0 +1,397 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] regulator: qcom-rpmh: add Q706F sleep overrides
+
+Cache BOB mode and L12A mode/enable overrides only during s2idle.
+Keep the independent WAKE values synchronized with successful ACTIVE
+writes and remove the override on resume, unwind or driver removal.
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+index 09d7f083de082b0fd8edd6867c2c0356ef4329e9..5c45c13087c983825fbd59266475c0ddf34fb7ac 100644
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+@@ -678,6 +678,7 @@ vreg_l10a_1p8: ldo10 {
+ 		/* l11 = VDD_SSC_CX (lxc.lvl) */
+ 
+ 		vreg_l12a_1p8: ldo12 {
++			qcom,q706f-sleep-lpm-off;
+ 			regulator-name = "vreg_l12a_1p8";
+ 			regulator-min-microvolt = <1800000>;
+ 			regulator-max-microvolt = <1800000>;
+@@ -754,6 +755,7 @@ regulators-2 {
+ 		vdd-bob-supply = <&vph_pwr>;
+ 
+ 		vreg_bob: bob {
++			qcom,q706f-sleep-bypass;
+ 			regulator-name = "vreg_bob";
+ 			regulator-min-microvolt = <3008000>;
+ 			regulator-max-microvolt = <4000000>;
+diff --git a/drivers/regulator/qcom-rpmh-regulator.c b/drivers/regulator/qcom-rpmh-regulator.c
+index 08e39499be86824d2aba827bcae852069f293aec..40844fb2489749ddc181f8bc113be524a50cd221 100644
+--- a/drivers/regulator/qcom-rpmh-regulator.c
++++ b/drivers/regulator/qcom-rpmh-regulator.c
+@@ -8,6 +8,8 @@
+ #include <linux/err.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/suspend.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
+@@ -137,6 +139,14 @@ struct rpmh_vreg_hw_data {
+ 	unsigned int			      (*of_map_mode)(unsigned int mode);
+ };
+ 
++static bool sleep_bob;
++module_param(sleep_bob, bool, 0644);
++MODULE_PARM_DESC(sleep_bob, "Q706F: BOB pass-through in s2idle");
++
++static bool sleep_l12a;
++module_param(sleep_l12a, bool, 0644);
++MODULE_PARM_DESC(sleep_l12a, "Q706F: L12A LPM and off in s2idle");
++
+ /**
+  * struct rpmh_vreg - individual RPMh regulator data structure encapsulating a
+  *		single regulator device
+@@ -162,6 +172,14 @@ struct rpmh_vreg_hw_data {
+  * @mode:			RPMh VRM regulator current framework mode
+  */
+ struct rpmh_vreg {
++	/* Only populated for DT opt-in resources. */
++	struct list_head		sleep_node;
++	struct mutex			sleep_lock;
++	const bool			*sleep_param;
++	struct tcs_cmd			sleep_cmds[2];
++	struct tcs_cmd			wake_cmds[2];
++	int				n_sleep_cmds;
++	bool				sleep_armed;
+ 	struct device			*dev;
+ 	u32				addr;
+ 	struct regulator_desc		rdesc;
+@@ -205,7 +223,15 @@ struct rpmh_vreg_init_data {
+ static int rpmh_regulator_send_request(struct rpmh_vreg *vreg,
+ 			struct tcs_cmd *cmd, bool wait_for_ack)
+ {
+-	int ret;
++	int i, ret;
++
++	if (vreg->n_sleep_cmds)
++		mutex_lock(&vreg->sleep_lock);
++
++	/* The RSC checks for pending ACTIVE writes before flushing TCS. */
++	for (i = 0; i < vreg->n_sleep_cmds; i++)
++		if (cmd->addr == vreg->sleep_cmds[i].addr)
++			break;
+ 
+ 	if (wait_for_ack || vreg->always_wait_for_ack)
+ 		ret = rpmh_write(vreg->dev, RPMH_ACTIVE_ONLY_STATE, cmd, 1);
+@@ -213,6 +239,16 @@ static int rpmh_regulator_send_request(struct rpmh_vreg *vreg,
+ 		ret = rpmh_write_async(vreg->dev, RPMH_ACTIVE_ONLY_STATE, cmd,
+ 					1);
+ 
++	if (!ret && i < vreg->n_sleep_cmds) {
++		vreg->wake_cmds[i].data = cmd->data;
++		if (vreg->sleep_armed)
++			ret = rpmh_set_sleep_override(vreg->dev, vreg->sleep_cmds,
++						      vreg->wake_cmds,
++						      vreg->n_sleep_cmds);
++	}
++
++	if (vreg->n_sleep_cmds)
++		mutex_unlock(&vreg->sleep_lock);
+ 	return ret;
+ }
+ 
+@@ -481,6 +517,37 @@ static const struct regulator_ops rpmh_regulator_xob_ops = {
+ 	.is_enabled		= rpmh_regulator_is_enabled,
+ };
+ 
++static void rpmh_regulator_init_sleep(struct rpmh_vreg *vreg,
++				      struct device_node *node, const char *resource)
++{
++	int i;
++
++	if (!of_machine_is_compatible("lenovo,q706f"))
++		return;
++
++	if (!strcmp(resource, "bobc1") &&
++	    of_property_read_bool(node, "qcom,q706f-sleep-bypass")) {
++		vreg->sleep_param = &sleep_bob;
++		vreg->sleep_cmds[0].data = vreg->hw_data->pmic_bypass_mode;
++		vreg->n_sleep_cmds = 1;
++	} else if (!strcmp(resource, "ldoa12") &&
++		   of_property_read_bool(node, "qcom,q706f-sleep-lpm-off")) {
++		vreg->sleep_param = &sleep_l12a;
++		vreg->sleep_cmds[0].data = PMIC5_LDO_MODE_LPM;
++		vreg->sleep_cmds[1].addr = vreg->addr + RPMH_REGULATOR_REG_ENABLE;
++		vreg->n_sleep_cmds = 2;
++	} else {
++		return;
++	}
++
++	mutex_init(&vreg->sleep_lock);
++	vreg->sleep_cmds[0].addr = vreg->addr + RPMH_REGULATOR_REG_VRM_MODE;
++	for (i = 0; i < vreg->n_sleep_cmds; i++) {
++		vreg->wake_cmds[i].addr = vreg->sleep_cmds[i].addr;
++		vreg->wake_cmds[i].data = UINT_MAX;
++	}
++}
++
+ /**
+  * rpmh_regulator_init_vreg() - initialize all attributes of an rpmh-regulator
+  * @vreg:		Pointer to the individual rpmh-regulator resource
+@@ -538,6 +605,7 @@ static int rpmh_regulator_init_vreg(struct rpmh_vreg *vreg, struct device *dev,
+ 	vreg->rdesc.name = rpmh_data->name;
+ 	vreg->rdesc.supply_name = rpmh_data->supply_name;
+ 	vreg->hw_data = rpmh_data->hw_data;
++	rpmh_regulator_init_sleep(vreg, node, rpmh_resource_name);
+ 
+ 	vreg->enabled = -EINVAL;
+ 	vreg->voltage_selector = -ENOTRECOVERABLE;
+@@ -1933,11 +2001,75 @@ static const struct rpmh_vreg_init_data pm660l_vreg_data[] = {
+ 	{}
+ };
+ 
++static void rpmh_regulator_clear_sleep(struct rpmh_vreg *vreg)
++{
++	guard(mutex)(&vreg->sleep_lock);
++
++	if (!vreg->sleep_armed)
++		return;
++
++	/* Successfully armed entries remain allocated in the RPMh cache. */
++	if (!WARN_ON(rpmh_set_sleep_override(vreg->dev, vreg->sleep_cmds,
++					    NULL, vreg->n_sleep_cmds)))
++		vreg->sleep_armed = false;
++}
++
++static int rpmh_regulator_resume_early(struct device *dev)
++{
++	struct list_head *list = dev_get_drvdata(dev);
++	struct rpmh_vreg *vreg;
++
++	list_for_each_entry(vreg, list, sleep_node)
++		rpmh_regulator_clear_sleep(vreg);
++	return 0;
++}
++
++static int rpmh_regulator_suspend_late(struct device *dev)
++{
++	struct list_head *list = dev_get_drvdata(dev);
++	struct rpmh_vreg *vreg;
++	int ret = 0;
++
++	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
++		return 0;
++
++	list_for_each_entry(vreg, list, sleep_node) {
++		if (!READ_ONCE(*vreg->sleep_param))
++			continue;
++
++		scoped_guard(mutex, &vreg->sleep_lock) {
++			ret = rpmh_set_sleep_override(dev, vreg->sleep_cmds,
++						      vreg->wake_cmds,
++						      vreg->n_sleep_cmds);
++			if (!ret)
++				vreg->sleep_armed = true;
++		}
++		if (ret) {
++			dev_err(dev, "%s: cannot arm sleep vote (%d); check ACTIVE votes\n",
++				vreg->rdesc.name, ret);
++			rpmh_regulator_resume_early(dev);
++			return ret;
++		}
++	}
++	return 0;
++}
++
++static const struct dev_pm_ops rpmh_regulator_pm_ops = {
++	.suspend_late = pm_sleep_ptr(rpmh_regulator_suspend_late),
++	.resume_early = pm_sleep_ptr(rpmh_regulator_resume_early),
++};
++
++static void rpmh_regulator_remove(struct platform_device *pdev)
++{
++	rpmh_regulator_resume_early(&pdev->dev);
++}
++
+ static int rpmh_regulator_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+ 	const struct rpmh_vreg_init_data *vreg_data;
+ 	struct rpmh_vreg *vreg;
++	struct list_head *sleep_list;
+ 	const char *pmic_id;
+ 	int ret;
+ 
+@@ -1951,6 +2083,12 @@ static int rpmh_regulator_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
++	sleep_list = devm_kmalloc(dev, sizeof(*sleep_list), GFP_KERNEL);
++	if (!sleep_list)
++		return -ENOMEM;
++	INIT_LIST_HEAD(sleep_list);
++	platform_set_drvdata(pdev, sleep_list);
++
+ 	for_each_available_child_of_node_scoped(dev->of_node, node) {
+ 		vreg = devm_kzalloc_obj(dev, *vreg);
+ 		if (!vreg)
+@@ -1961,6 +2099,9 @@ static int rpmh_regulator_probe(struct platform_device *pdev)
+ 		if (ret < 0)
+ 			return ret;
+ 
++		if (vreg->n_sleep_cmds)
++			list_add_tail(&vreg->sleep_node, sleep_list);
++
+ 		ret = rpmh_regulator_determine_initial_mode(vreg);
+ 		if (ret < 0)
+ 			dev_err(dev, "failed to read initial mode for %s\n",
+@@ -2135,10 +2276,12 @@ MODULE_DEVICE_TABLE(of, rpmh_regulator_match_table);
+ static struct platform_driver rpmh_regulator_driver = {
+ 	.driver = {
+ 		.name = "qcom-rpmh-regulator",
++		.pm = pm_ptr(&rpmh_regulator_pm_ops),
+ 		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
+ 		.of_match_table	= of_match_ptr(rpmh_regulator_match_table),
+ 	},
+ 	.probe = rpmh_regulator_probe,
++	.remove = rpmh_regulator_remove,
+ };
+ module_platform_driver(rpmh_regulator_driver);
+ 
+diff --git a/drivers/soc/qcom/rpmh.c b/drivers/soc/qcom/rpmh.c
+index 360242a315e37eff41a4fec8b3db8f26a6af48e6..7a6090fdc893661a15fcf6504e0a832f788249a1 100644
+--- a/drivers/soc/qcom/rpmh.c
++++ b/drivers/soc/qcom/rpmh.c
+@@ -45,6 +45,9 @@
+  *
+  * @addr: the address of the resource
+  * @sleep_val: the sleep vote
++ * @override_sleep: temporary client-owned sleep vote
++ * @override_wake: last submitted active vote to restore on wake
++ * @overridden: use the temporary pair instead of the ordinary cache entry
+  * @wake_val: the wake vote
+  * @list: linked list obj
+  */
+@@ -52,6 +55,9 @@ struct cache_req {
+ 	u32 addr;
+ 	u32 sleep_val;
+ 	u32 wake_val;
++	u32 override_sleep;
++	u32 override_wake;
++	bool overridden;
+ 	struct list_head list;
+ };
+ 
+@@ -451,12 +457,54 @@ int rpmh_write_batch(const struct device *dev, enum rpmh_state state,
+ }
+ EXPORT_SYMBOL_GPL(rpmh_write_batch);
+ 
+-static int is_req_valid(struct cache_req *req)
++/*
++ * Install or remove a temporary pair for registers owned exclusively by the
++ * caller. Their ACTIVE requests must already have created cache entries.
++ * The caller serializes updates and supplies the last successful ACTIVE
++ * values. A NULL wake array removes only this override.
++ */
++int rpmh_set_sleep_override(const struct device *dev,
++			    const struct tcs_cmd *sleep,
++			    const struct tcs_cmd *wake, u32 n)
+ {
+-	return (req->sleep_val != UINT_MAX &&
+-		req->wake_val != UINT_MAX &&
+-		req->sleep_val != req->wake_val);
++	struct rpmh_ctrlr *ctrlr = get_rpmh_ctrlr(dev);
++	struct cache_req *reqs[MAX_RPMH_PAYLOAD];
++	unsigned long flags;
++	unsigned int i;
++	int ret = 0;
++
++	if (!sleep || !n || n > ARRAY_SIZE(reqs))
++		return -EINVAL;
++
++	spin_lock_irqsave(&ctrlr->cache_lock, flags);
++	for (i = 0; i < n; i++) {
++		reqs[i] = __find_req(ctrlr, sleep[i].addr);
++		if (!reqs[i]) {
++			ret = -ENODATA;
++			goto unlock;
++		}
++		if (wake && (wake[i].addr != sleep[i].addr ||
++			     wake[i].data == UINT_MAX ||
++			     reqs[i]->sleep_val != UINT_MAX)) {
++			ret = -EINVAL;
++			goto unlock;
++		}
++	}
++
++	for (i = 0; i < n; i++) {
++		if (wake) {
++			reqs[i]->override_sleep = sleep[i].data;
++			reqs[i]->override_wake = wake[i].data;
++		}
++		reqs[i]->overridden = !!wake;
++	}
++	ctrlr->dirty = true;
++
++unlock:
++	spin_unlock_irqrestore(&ctrlr->cache_lock, flags);
++	return ret;
+ }
++EXPORT_SYMBOL_GPL(rpmh_set_sleep_override);
+ 
+ static int send_single(struct rpmh_ctrlr *ctrlr, enum rpmh_state state,
+ 		       u32 addr, u32 data)
+@@ -510,17 +558,20 @@ int rpmh_flush(struct rpmh_ctrlr *ctrlr)
+ 		goto exit;
+ 
+ 	list_for_each_entry(p, &ctrlr->cache, list) {
+-		if (!is_req_valid(p)) {
++		u32 sleep = p->overridden ? p->override_sleep : p->sleep_val;
++		u32 wake = p->overridden ? p->override_wake : p->wake_val;
++
++		if (sleep == UINT_MAX || wake == UINT_MAX || sleep == wake) {
+ 			pr_debug("%s: skipping RPMH req: a:%#x s:%#x w:%#x",
+-				 __func__, p->addr, p->sleep_val, p->wake_val);
++				 __func__, p->addr, sleep, wake);
+ 			continue;
+ 		}
+ 		ret = send_single(ctrlr, RPMH_SLEEP_STATE, p->addr,
+-				  p->sleep_val);
++				  sleep);
+ 		if (ret)
+ 			goto exit;
+ 		ret = send_single(ctrlr, RPMH_WAKE_ONLY_STATE, p->addr,
+-				  p->wake_val);
++				  wake);
+ 		if (ret)
+ 			goto exit;
+ 	}
+diff --git a/include/soc/qcom/rpmh.h b/include/soc/qcom/rpmh.h
+index 14ecbf242b6bd67c8167c176ed0970f42432f4f4..ebaaa4aee6df7223dabf69ffe3a733c3362a8b71 100644
+--- a/include/soc/qcom/rpmh.h
++++ b/include/soc/qcom/rpmh.h
+@@ -13,6 +13,10 @@
+ #if IS_ENABLED(CONFIG_QCOM_RPMH)
+ int rpmh_read(const struct device *dev, struct tcs_cmd *cmd);
+ 
++int rpmh_set_sleep_override(const struct device *dev,
++			    const struct tcs_cmd *sleep,
++			    const struct tcs_cmd *wake, u32 n);
++
+ int rpmh_write(const struct device *dev, enum rpmh_state state,
+ 	       const struct tcs_cmd *cmd, u32 n);
+ 
+@@ -26,6 +30,11 @@ void rpmh_invalidate(const struct device *dev);
+ 
+ #else
+ 
++static inline int rpmh_set_sleep_override(const struct device *dev,
++					  const struct tcs_cmd *sleep,
++					  const struct tcs_cmd *wake, u32 n)
++{ return -ENODEV; }
++
+ static inline int rpmh_read(const struct device *dev, struct tcs_cmd *cmd)
+ { return -ENODEV; }
+ 

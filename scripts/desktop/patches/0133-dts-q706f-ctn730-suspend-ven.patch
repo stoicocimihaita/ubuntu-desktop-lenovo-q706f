@@ -1,0 +1,18 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] arm64: dts: qcom: q706f: opt CTN730 into VEN experiment
+
+Allow the optional out-of-tree CTN730 variant to deassert VEN in
+system suspend when its runtime switch is enabled. The ordinary
+driver does not consume this property.
+
+---
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+@@ -926,6 +926,7 @@
+ 	pen-charger@28 {
+ 		compatible = "nxp,ctn730";
+ 		reg = <0x28>;
++		nxp,q706f-allow-suspend-ven-off;
+ 
+ 		interrupts-extended = <&tlmm 111 IRQ_TYPE_LEVEL_HIGH>;
+ 		enable-gpios = <&pm8150l_gpios 8 GPIO_ACTIVE_HIGH>;

@@ -1,0 +1,242 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] Input: goodix-berlin - send the pen-on command, add a pen_mode attribute
+
+Origin: behaviour of the Lenovo stock driver for the TB-Q706F
+(android_kernel_lenovo_sm8250, drivers/input/touchscreen/goodix/:
+brl_send_cmd() in goodix_brl_hw.c, goodix_ts_pen_on()/goodix_ts_pen_off()
+and goodix_ctn730_notifier_callback() in goodix_ts_core.c).
+
+The GT6975P firmware has a pen digitizer mode switched by two commands:
+0x14 "pen on" and 0x15 "pen off". The stock driver sends pen off at probe
+and while the Precision Pen 3 is docked on the CTN730 wireless charger,
+and pen on when the pen is taken off the dock (and again after resume).
+The mainline driver never sends either, so once the firmware is left in
+pen-off state no stylus event is ever reported, while fingers keep working.
+
+Add a minimal command sender modelled on brl_send_cmd(): read cmd_addr
+from the IC_INFO misc block, write { state = 0, ack = 0, len = 4, cmd,
+le16 u8-sum checksum of len + cmd } (16 bytes, zero padded) to cmd_addr
+and poll the ack byte (0x80 ok, 0x02 busy / 0x00 pending: poll again,
+anything else: rewrite), with the vendor's retry counts and delays.
+
+When a stylus input device is registered, send pen on at the end of probe
+and re-send the last requested mode after resume (the IC is power cycled
+in suspend). Add a pen_mode device attribute (write 1 = pen on 0x14,
+0 = pen off 0x15; read = last requested mode) for testing and for a
+dock-aware userspace hook (the CTN730 pen-attached state). One dev_info
+line logs the ack of each command.
+
+diff --git a/drivers/input/touchscreen/goodix_berlin_core.c b/drivers/input/touchscreen/goodix_berlin_core.c
+index 5ab31d98678d887c3426444cccd140194be642db..196d1f4c63cd0714ba4c587503a382e6eea8e8e5 100644
+--- a/drivers/input/touchscreen/goodix_berlin_core.c
++++ b/drivers/input/touchscreen/goodix_berlin_core.c
+@@ -28,6 +28,7 @@
+ #include <linux/input.h>
+ #include <linux/input/mt.h>
+ #include <linux/input/touchscreen.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/property.h>
+ #include <linux/regmap.h>
+@@ -62,6 +63,16 @@
+ 
+ #define GOODIX_BERLIN_CHECKSUM_SIZE		sizeof(u16)
+ 
++/* Command interface, at ic_info.misc.cmd_addr */
++#define GOODIX_BERLIN_CMD_LEN			4	/* len + cmd + checksum */
++#define GOODIX_BERLIN_CMD_BUF_LEN		16
++#define GOODIX_BERLIN_CMD_RETRY			6
++#define GOODIX_BERLIN_CMD_ACK_BUSY		0x02
++#define GOODIX_BERLIN_CMD_ACK_BUFFER_OVERFLOW	0x03
++#define GOODIX_BERLIN_CMD_ACK_OK		0x80
++#define GOODIX_BERLIN_CMD_PEN_ON		0x14
++#define GOODIX_BERLIN_CMD_PEN_OFF		0x15
++
+ /* BIT(3) is unused */
+ #define GOODIX_BERLIN_STYLUS_BTN_MASK		GENMASK(3, 1)
+ static unsigned int stylus_btn[] = {BTN_STYLUS, BTN_STYLUS2};
+@@ -201,6 +212,11 @@ struct goodix_berlin_core {
+ 
+ 	/* Runtime parameters extracted from IC_INFO buffer  */
+ 	u32 touch_data_addr;
++	u32 cmd_addr;
++
++	/* Serializes commands; pen_mode is the last pen mode requested */
++	struct mutex cmd_lock;
++	bool pen_mode;
+ 
+ 	const struct goodix_berlin_ic_data *ic_data;
+ 
+@@ -379,6 +395,7 @@ static int goodix_berlin_parse_ic_info(struct goodix_berlin_core *cd,
+ 
+ 	misc = (struct goodix_berlin_ic_info_misc *)&data[offset];
+ 	cd->touch_data_addr = le32_to_cpu(misc->touch_data_addr);
++	cd->cmd_addr = le32_to_cpu(misc->cmd_addr);
+ 
+ 	return 0;
+ 
+@@ -866,6 +883,80 @@ static int goodix_berlin_input_dev_config(struct goodix_berlin_core *cd,
+ 	return 0;
+ }
+ 
++/*
++ * Send a parameterless command, as the vendor driver's brl_send_cmd() does:
++ * write { state = 0, ack = 0, len, cmd, u8-sum checksum (le16) } to cmd_addr,
++ * then poll the ack byte. Returns the last ack byte (>= 0) or a bus error.
++ */
++static int goodix_berlin_send_cmd(struct goodix_berlin_core *cd, u8 cmd_code)
++{
++	u8 buf[GOODIX_BERLIN_CMD_BUF_LEN] = { };
++	u8 ack[GOODIX_BERLIN_CMD_BUF_LEN];
++	int retry, i, error;
++	u16 sum;
++
++	if (!cd->cmd_addr)
++		return -EOPNOTSUPP;
++
++	buf[2] = GOODIX_BERLIN_CMD_LEN;
++	buf[3] = cmd_code;
++	sum = buf[2] + buf[3];
++	put_unaligned_le16(sum, &buf[4]);
++
++	guard(mutex)(&cd->cmd_lock);
++
++	for (retry = 0; retry < GOODIX_BERLIN_CMD_RETRY; retry++) {
++		error = regmap_raw_write(cd->regmap, cd->cmd_addr,
++					 buf, sizeof(buf));
++		if (error)
++			return error;
++
++		for (i = 0; i < GOODIX_BERLIN_CMD_RETRY; i++) {
++			error = regmap_raw_read(cd->regmap, cd->cmd_addr,
++						ack, sizeof(ack));
++			if (error)
++				return error;
++
++			if (ack[1] == GOODIX_BERLIN_CMD_ACK_OK) {
++				usleep_range(2000, 2100);
++				return ack[1];
++			}
++			if (ack[1] == GOODIX_BERLIN_CMD_ACK_BUSY || !ack[1]) {
++				usleep_range(1000, 1100);
++				continue;
++			}
++			if (ack[1] == GOODIX_BERLIN_CMD_ACK_BUFFER_OVERFLOW)
++				usleep_range(10000, 11000);
++			usleep_range(1000, 1100);
++			break;
++		}
++	}
++
++	dev_warn(cd->dev, "cmd 0x%02x: no valid ack, buf %*ph\n",
++		 cmd_code, (int)sizeof(ack), ack);
++	return ack[1];
++}
++
++static int goodix_berlin_set_pen_mode(struct goodix_berlin_core *cd, bool on)
++{
++	u8 code = on ? GOODIX_BERLIN_CMD_PEN_ON : GOODIX_BERLIN_CMD_PEN_OFF;
++	int ret;
++
++	cd->pen_mode = on;
++	ret = goodix_berlin_send_cmd(cd, code);
++	if (ret < 0)
++		dev_err(cd->dev, "pen %s (cmd 0x%02x at 0x%x): error %d\n",
++			on ? "on" : "off", code, cd->cmd_addr, ret);
++	else
++		dev_info(cd->dev, "pen %s (cmd 0x%02x at 0x%x): ack 0x%02x%s\n",
++			 on ? "on" : "off", code, cd->cmd_addr, ret,
++			 ret == GOODIX_BERLIN_CMD_ACK_OK ? " (ok)" : "");
++
++	if (ret < 0)
++		return ret;
++	return ret == GOODIX_BERLIN_CMD_ACK_OK ? 0 : -EIO;
++}
++
+ static int goodix_berlin_suspend(struct device *dev)
+ {
+ 	struct goodix_berlin_core *cd = dev_get_drvdata(dev);
+@@ -887,6 +978,10 @@ static int goodix_berlin_resume(struct device *dev)
+ 
+ 	enable_irq(cd->irq);
+ 
++	/* The firmware forgets the pen mode across a power cycle */
++	if (cd->stylus_dev)
++		goodix_berlin_set_pen_mode(cd, cd->pen_mode);
++
+ 	return 0;
+ }
+ 
+@@ -933,7 +1028,46 @@ static const struct bin_attribute *const goodix_berlin_bin_attrs[] = {
+ 	NULL,
+ };
+ 
++static ssize_t pen_mode_show(struct device *dev,
++			     struct device_attribute *attr, char *buf)
++{
++	struct goodix_berlin_core *cd = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%d\n", cd->pen_mode);
++}
++
++static ssize_t pen_mode_store(struct device *dev,
++			      struct device_attribute *attr,
++			      const char *buf, size_t count)
++{
++	struct goodix_berlin_core *cd = dev_get_drvdata(dev);
++	bool on;
++	int error;
++
++	error = kstrtobool(buf, &on);
++	if (error)
++		return error;
++
++	/* Powered off in system sleep: resume() sends the stored mode */
++	if (dev->power.is_suspended) {
++		cd->pen_mode = on;
++		return count;
++	}
++
++	error = goodix_berlin_set_pen_mode(cd, on);
++
++	return error ? error : count;
++}
++
++static DEVICE_ATTR_RW(pen_mode);
++
++static struct attribute *goodix_berlin_attrs[] = {
++	&dev_attr_pen_mode.attr,
++	NULL,
++};
++
+ static const struct attribute_group goodix_berlin_attr_group = {
++	.attrs = goodix_berlin_attrs,
+ 	.bin_attrs = goodix_berlin_bin_attrs,
+ };
+ 
+@@ -964,6 +1098,10 @@ int goodix_berlin_probe(struct device *dev, int irq, const struct input_id *id,
+ 	cd->irq = irq;
+ 	cd->ic_data = ic_data;
+ 
++	error = devm_mutex_init(dev, &cd->cmd_lock);
++	if (error)
++		return error;
++
+ 	cd->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
+ 	if (IS_ERR(cd->reset_gpio))
+ 		return dev_err_probe(dev, PTR_ERR(cd->reset_gpio),
+@@ -1022,6 +1160,14 @@ int goodix_berlin_probe(struct device *dev, int irq, const struct input_id *id,
+ 
+ 	dev_set_drvdata(dev, cd);
+ 
++	/*
++	 * The vendor driver keeps the pen digitizer off while the pen is
++	 * docked on the wireless charger and turns it on (command 0x14) when
++	 * it is taken off. Without that command the firmware reports no pen.
++	 */
++	if (cd->stylus_dev)
++		goodix_berlin_set_pen_mode(cd, true);
++
+ 	dev_dbg(dev, "Goodix Berlin %s Touchscreen Controller",
+ 		cd->fw_version.patch_pid);
+ 

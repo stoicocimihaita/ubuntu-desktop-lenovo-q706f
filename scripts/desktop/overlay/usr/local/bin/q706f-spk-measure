@@ -1,0 +1,121 @@
+#!/bin/sh
+# Run as the desktop user. Take one measurement per invocation.
+set -eu
+export LC_ALL=C
+umask 077
+
+speaker=q706f_speakers
+hardware=alsa_output.platform-sound.HiFi__Speaker__sink
+mic=alsa_input.platform-sound.HiFi__Mic__source
+
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+
+check_route() {
+    wpctl inspect @DEFAULT_AUDIO_SINK@ 2>/dev/null |
+        awk -v name="$speaker" 'NF >= 3 && $(NF-2) == "node.name" && $NF == "\"" name "\"" { ok=1 }
+                             END { exit !ok }' || return 1
+    pw-dump | jq -er --arg speaker "$speaker" --arg hardware "$hardware" '
+      def node($name):
+        [.[] | select(.type == "PipeWire:Interface:Node" and
+                      .info.props["node.name"] == $name)] | select(length == 1) | first;
+      node($speaker) as $sink | node($speaker + ".out") as $out | node($hardware) as $hw |
+      [.[] | select(.type == "PipeWire:Interface:Link" and
+                    .info["input-node-id"] == $hw.id) | .info] as $links |
+      select($sink.info.props["q706f.speaker-protection"] | test("^hpf[0-9]+-dpl$") and
+             ($links | length) == 2 and
+             all($links[]; .["output-node-id"] == $out.id and
+                           (.state == "active" or .state == "paused")) and
+             ([$links[]."input-port-id"] | unique | length) == 2 and
+             ([$links[]."output-port-id"] | unique | length) == 2) |
+      [$sink.id, $hw.id] | @tsv'
+}
+
+if [ "${1:-}" = --check ] && [ "$#" -eq 1 ]; then
+    check_route >/dev/null || fail "Protected default or exclusive stereo speaker route missing."
+    printf '%s\n' "Protected default feeds both hardware speaker ports."
+    exit 0
+fi
+[ "$#" -eq 2 ] || fail "Usage: q706f-spk-measure MUSIC_FILE LEVEL_1_TO_100 | --check"
+[ -f "$1" ] || fail "Use a local music file."
+case $2 in
+    [1-9]|[1-9][0-9]|100) level=$2 ;;
+    *) fail "Level must be an integer between 1 and 100." ;;
+esac
+case $1 in /*) music=$1 ;; *) music=./$1 ;; esac
+
+ids=$(check_route) || fail "Protected default or exclusive stereo speaker route missing."
+# jq emits two numeric IDs separated by a tab.
+set -- $ids
+sink_id=$1
+hw_volume=$(wpctl get-volume "$2") || fail "Cannot read hardware volume."
+printf '%s\n' "$hw_volume" | awk '$1 == "Volume:" && NF == 2 && $2 <= 1 { ok=1 }
+                                END { exit !ok }' || fail "Hardware sink is muted or above unity."
+old_volume=$(wpctl get-volume "$sink_id") || fail "Cannot read protected sink volume."
+old_level=$(printf '%s\n' "$old_volume" |
+    awk '$1 == "Volume:" && NF == 2 && $2 <= 1 { print $2 }')
+[ -n "$old_level" ] || fail "Protected sink is muted or above 100%."
+
+out=$(mktemp -d "./q706f-${level}.XXXXXX")
+record_pid=
+restore_volume=false
+keep=false
+cleanup() {
+    if [ -n "$record_pid" ]; then
+        kill -TERM "$record_pid" 2>/dev/null || :
+        wait "$record_pid" 2>/dev/null || :
+    fi
+    if "$restore_volume" && [ "$(check_route)" = "$ids" ]; then
+        wpctl set-volume --limit 1.0 "$sink_id" "$old_level" ||
+            printf '%s\n' "Restore the protected slider manually." >&2
+    elif "$restore_volume"; then
+        printf '%s\n' "Route changed. Recheck protection before restoring the slider." >&2
+    fi
+    rm -f "$out/clip.wav"
+    if ! "$keep"; then
+        rm -f "$out/mic.wav"
+        rmdir "$out"
+    fi
+}
+trap cleanup 0
+trap 'exit 130' INT
+trap 'exit 143' HUP TERM
+
+ffmpeg -nostdin -v error -t 8 -i "$music" -map 0:a:0 -vn -sn -dn \
+    -af 'atrim=duration=8,afade=t=in:d=0.03,areverse,afade=t=in:d=0.05,areverse' \
+    -ac 2 -ar 48000 -c:a pcm_f32le "$out/clip.wav"
+stream=q706f_spk_measure_$$
+strict='"node.dont-fallback":true,"node.dont-move":true,"node.dont-reconnect":true'
+pw-record --target "$mic" --rate 48000 --channels 1 --format f32 \
+    -P "{\"node.name\":\"$stream\",$strict}" "$out/mic.wav" &
+record_pid=$!
+
+mic_linked() {
+    pw-dump | jq -e --arg mic "$mic" --arg stream "$stream" '
+      def ids($name):
+        [.[] | select(.type == "PipeWire:Interface:Node" and
+                      .info.props["node.name"] == $name) | .id];
+      ids($mic) as $m | ids($stream) as $r |
+      any(.[]; .type == "PipeWire:Interface:Link" and .info.state == "active" and
+               .info["output-node-id"] == $m[0] and .info["input-node-id"] == $r[0])' >/dev/null
+}
+for attempt in 1 2 3 4 5; do
+    kill -0 "$record_pid" 2>/dev/null || fail "Internal mic recorder stopped."
+    if mic_linked; then break; fi
+    sleep 1
+done
+mic_linked || fail "No active link from the internal mic."
+sleep 1
+[ "$(check_route)" = "$ids" ] || fail "Speaker route changed."
+restore_volume=true
+wpctl set-volume --limit 1.0 "$sink_id" "$level%"
+timeout --foreground --kill-after=2s 13s pw-play --target "$speaker" --volume 1.0 \
+    -P "{$strict}" "$out/clip.wav"
+mic_linked || fail "Internal mic link dropped."
+[ "$(check_route)" = "$ids" ] || fail "Speaker route changed."
+sleep 1
+kill -TERM "$record_pid"
+wait "$record_pid" || fail "Recorder did not finish cleanly."
+record_pid=
+ffmpeg -nostdin -v error -xerror -i "$out/mic.wav" -f null -
+keep=true
+printf 'Level %s%% | %s/mic.wav\n' "$level" "$out"

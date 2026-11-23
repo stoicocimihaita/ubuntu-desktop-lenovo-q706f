@@ -1,0 +1,207 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] i2c: qcom-cci: reset on power-up, per-master reset and retry on timeout
+
+On the Lenovo Tab P12 Pro the first CCI write to a camera sensor at boot
+sometimes times out ("master N queue 0 timeout"), so ov8856 and s5k5e9
+failed their probe with -EIO in some boots and bound only when the driver
+was reloaded. The vendor stack resets the CCI master after the sensor is
+powered; mainline resets the controller only at probe and after a timeout,
+and runtime resume only re-initialises it.
+
+Reset the controller on every runtime resume, reset only the stuck master
+on a queue timeout (full reset as fallback), and return -EAGAIN with
+adapter retries = 2 so the I2C core repeats the transfer instead of failing
+the probe. RST_DONE now completes only waiters that asked for a reset.
+
+Tested on q706f (module on 7.3.4, camera reload service disabled): 3 boots,
+3/3 sensors bound each time; in 2 boots a queue timeout happened and the
+retried transfer succeeded.
+---
+--- a/drivers/i2c/busses/i2c-qcom-cci.c
++++ b/drivers/i2c/busses/i2c-qcom-cci.c
+@@ -109,6 +109,7 @@
+ 	u16 master;
+ 	u8 mode;
+ 	int status;
++	bool reset_pending;
+ 	struct completion irq_complete;
+ 	struct cci *cci;
+ };
+@@ -128,6 +129,8 @@
+ 	struct clk_bulk_data *clocks;
+ 	int nclocks;
+ 	struct cci_master master[NUM_MASTERS];
++	bool reset_pending;
++	struct completion reset_complete;
+ };
+ 
+ static irqreturn_t cci_isr(int irq, void *dev)
+@@ -135,15 +138,32 @@
+ 	struct cci *cci = dev;
+ 	u32 val, reset = 0;
+ 	int ret = IRQ_NONE;
++	int i;
+ 
+ 	val = readl(cci->base + CCI_IRQ_STATUS_0);
+ 	writel(val, cci->base + CCI_IRQ_CLEAR_0);
+ 	writel(0x1, cci->base + CCI_IRQ_GLOBAL_CLEAR_CMD);
+ 
+ 	if (val & CCI_IRQ_STATUS_0_RST_DONE_ACK) {
+-		complete(&cci->master[0].irq_complete);
+-		if (cci->master[1].master)
+-			complete(&cci->master[1].irq_complete);
++		/*
++		 * RST_DONE is common to both masters: only wake up the
++		 * waiters that actually asked for a reset. Waking up the
++		 * other master would end its in-flight transfer early with a
++		 * stale status (a write reported as done although it was
++		 * never executed, or a short read).
++		 */
++		for (i = 0; i < NUM_MASTERS; i++) {
++			struct cci_master *m = &cci->master[i];
++
++			if (m->cci && READ_ONCE(m->reset_pending)) {
++				WRITE_ONCE(m->reset_pending, false);
++				complete(&m->irq_complete);
++			}
++		}
++		if (READ_ONCE(cci->reset_pending)) {
++			WRITE_ONCE(cci->reset_pending, false);
++			complete(&cci->reset_complete);
++		}
+ 		ret = IRQ_HANDLED;
+ 	}
+ 
+@@ -164,11 +184,13 @@
+ 	}
+ 
+ 	if (unlikely(val & CCI_IRQ_STATUS_0_I2C_M0_Q0Q1_HALT_ACK)) {
++		WRITE_ONCE(cci->master[0].reset_pending, true);
+ 		reset |= CCI_RESET_CMD_M0_MASK;
+ 		ret = IRQ_HANDLED;
+ 	}
+ 
+ 	if (unlikely(val & CCI_IRQ_STATUS_0_I2C_M1_Q0Q1_HALT_ACK)) {
++		WRITE_ONCE(cci->master[1].reset_pending, true);
+ 		reset |= CCI_RESET_CMD_M1_MASK;
+ 		ret = IRQ_HANDLED;
+ 	}
+@@ -270,15 +292,13 @@
+ 
+ static int cci_reset(struct cci *cci)
+ {
+-	/*
+-	 * we reset the whole controller, here and for implicity use
+-	 * master[0].xxx for waiting on it.
+-	 */
+-	reinit_completion(&cci->master[0].irq_complete);
++	/* Reset the whole controller (both masters). */
++	reinit_completion(&cci->reset_complete);
++	WRITE_ONCE(cci->reset_pending, true);
+ 	writel(CCI_RESET_CMD_MASK, cci->base + CCI_RESET_CMD);
+ 
+-	if (!wait_for_completion_timeout(&cci->master[0].irq_complete,
+-					 CCI_TIMEOUT)) {
++	if (!wait_for_completion_timeout(&cci->reset_complete, CCI_TIMEOUT)) {
++		WRITE_ONCE(cci->reset_pending, false);
+ 		dev_err(cci->dev, "CCI reset timeout\n");
+ 		return -ETIMEDOUT;
+ 	}
+@@ -288,6 +308,35 @@
+ 	return 0;
+ }
+ 
++static int cci_reset_master(struct cci *cci, u8 master)
++{
++	struct cci_master *m = &cci->master[master];
++	unsigned long left = CCI_TIMEOUT;
++
++	/*
++	 * Reset only the master that got stuck, so that a transfer running
++	 * on the other master of the same controller is not aborted.
++	 */
++	reinit_completion(&m->irq_complete);
++	WRITE_ONCE(m->reset_pending, true);
++	writel(master ? CCI_RESET_CMD_M1_MASK : CCI_RESET_CMD_M0_MASK,
++	       cci->base + CCI_RESET_CMD);
++
++	/* A late report of the stuck queue may complete irq_complete first. */
++	while (READ_ONCE(m->reset_pending) && left)
++		left = wait_for_completion_timeout(&m->irq_complete, left);
++
++	if (READ_ONCE(m->reset_pending)) {
++		WRITE_ONCE(m->reset_pending, false);
++		dev_err(cci->dev, "master %u reset timeout\n", master);
++		return cci_reset(cci);
++	}
++
++	cci_init(cci);
++
++	return 0;
++}
++
+ static int cci_run_queue(struct cci *cci, u8 master, u8 queue)
+ {
+ 	u32 val;
+@@ -301,10 +350,17 @@
+ 
+ 	if (!wait_for_completion_timeout(&cci->master[master].irq_complete,
+ 					 CCI_TIMEOUT)) {
+-		dev_err(cci->dev, "master %d queue %d timeout\n",
+-			master, queue);
+-		cci_reset(cci);
+-		return -ETIMEDOUT;
++		dev_warn(cci->dev, "master %d queue %d timeout\n",
++			 master, queue);
++		/*
++		 * A stuck master (seen on the first transfer after the camera
++		 * supplies came up while the controller was clocked) works
++		 * again after a reset: let the I2C core retry the transfer
++		 * (adap.retries) instead of failing the sensor probe.
++		 */
++		if (cci_reset_master(cci, master))
++			return -ETIMEDOUT;
++		return -EAGAIN;
+ 	}
+ 
+ 	return cci->master[master].status;
+@@ -488,7 +544,20 @@
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * The controller may have lost its state (TITAN_TOP GDSC) and the
++	 * camera supplies, hence the bus pull-ups, may have been switched
++	 * while it was unclocked. Reset it at every power-up, as the
++	 * downstream cam_cci driver does (cam_cci_init_master()); cci_init()
++	 * first so that RST_DONE is unmasked.
++	 */
+ 	cci_init(cci);
++	ret = cci_reset(cci);
++	if (ret) {
++		cci_disable_clocks(cci);
++		return ret;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -550,6 +619,9 @@
+ 		i2c_set_adapdata(&master->adap, master);
+ 		snprintf(master->adap.name, sizeof(master->adap.name), "Qualcomm-CCI");
+ 
++		/* cci_run_queue() returns -EAGAIN after resetting a stuck master */
++		master->adap.retries = 2;
++
+ 		master->mode = I2C_MODE_STANDARD;
+ 		ret = of_property_read_u32(child, "clock-frequency", &val);
+ 		if (!ret) {
+@@ -562,6 +634,8 @@
+ 		init_completion(&master->irq_complete);
+ 	}
+ 
++	init_completion(&cci->reset_complete);
++
+ 	/* Memory */
+ 
+ 	cci->base = devm_platform_get_and_ioremap_resource(pdev, 0, &r);

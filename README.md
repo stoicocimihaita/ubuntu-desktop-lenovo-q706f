@@ -9,10 +9,12 @@ Discussion, questions and test reports: [XDA thread](https://xdaforums.com/t/rom
 
 - **Stage: bring-up.** It runs as the author's daily test system on **one** tablet
   (8 GB / 256 GB, ROW), but it is not a finished product. Treat it as a developer preview.
-- **Kernel:** upstream **Linux 7.3.4** (kernel.org tarball, sha256 pinned) plus the patch
-  series in [`scripts/desktop/patches/`](scripts/desktop/patches/README) (28 patches: the
-  q706f device support derived from silime's mainline tree, the project's own patches and
-  upstream fixes/backports).
+- **Kernel:** the author's tablet runs mainline **Linux 7.4-rc3** with the series in
+  [`scripts/desktop/patches-7.4/`](scripts/desktop/patches-7.4/README)
+  (`build-kernel-7.4.sh`). The previous base, upstream **Linux 7.3.4** (kernel.org tarball,
+  sha256 pinned) with [`scripts/desktop/patches/`](scripts/desktop/patches/README), is still
+  buildable with `build-kernel.sh`. Both series carry the q706f device support derived from
+  silime's mainline tree, the project's own patches and upstream fixes/backports.
 - **Userland:** stock Ubuntu 26.04 (`resolute`) arm64 from `ports.ubuntu.com`, built with
   `mmdebstrap`, plus a small device overlay (udev rules, systemd units, helper scripts).
 - **Boot:** the Lenovo ABL boots a header-v0 `boot.img` (Image.gz + appended mainline DTB +
@@ -39,6 +41,45 @@ it is no longer maintained.
 | ![About](docs/screenshots/03-about.png) | ![On-screen keyboard](docs/screenshots/04-on-screen-keyboard.png) |
 | Settings → About | On-screen keyboard (GJS OSK) |
 
+## What changed on 2026-11-23 (Linux 7.4-rc3)
+
+The tablet now runs mainline Linux **7.4-rc3** with the patch series in
+`scripts/desktop/patches-7.4/` (build: `scripts/desktop/build-kernel-7.4.sh`).
+Results are from one tablet.
+
+- **GPU and Chrome video.** New device-tree patch `0139` adds per-frequency GPU
+  DDR bandwidth votes and ACD settings. Without it the GPU could hang the
+  tablet at its top frequency; with it, Chrome played fullscreen YouTube at
+  **2160p60** for about 10 minutes with seeking. Video decoding is still done
+  on the CPU (4K60 VP9 drops ~6 % of frames, 1440p60 is smooth). An optional
+  Mesa 26.3.1 build is in `scripts/desktop/mesa/` (used for Chrome only).
+- **Speakers.** New PipeWire chain in front of the four amplifiers: −8 dB
+  headroom, +3 dB at 220 Hz, a 4th-order 120 Hz high-pass and an x42 true-peak
+  limiter at −9 dBTP. Amplifier gain is 0 dB as on stock. A WirePlumber hook
+  blocks any direct route to the raw speaker sink, so audio cannot bypass the
+  filter; if the limiter plugin is missing the speaker output stays silent.
+  Needs `x42-plugins` and `libspa-0.2-modules-extra`. This is not the stock
+  Cirrus protection (no temperature or excursion feedback).
+- **Deep sleep.** 7.4-rc3 reaches CXSD/AOSD/DDR on every suspend; ~55 mA
+  overnight with the low-power switches off. All eight low-power switches
+  (patches 0130–0137) passed isolated and combined suspend/resume tests on
+  7.4 and are now on by default (`/etc/default/q706f-lpm`); the overnight
+  figure with them on is still being measured.
+- **Clock.** The boot clock no longer jumps backwards: a fake-hwclock
+  checkpoint that only moves the clock forward replaces the RTC-triggered
+  restore (the PMIC RTC has no usable offset on mainline).
+- **Fast charging.** 9 V USB-PD works on 7.4 (patches 0116 + 0138): 9 V/3 A
+  contract, about 4 A into the battery. In ~10 minutes the PMIC paused input twice
+  for under 5 s (USBIN overvoltage flag at ~9.0 V); under investigation.
+- **Cameras.** All three (main rear with autofocus, secondary rear, front)
+  work on 7.4 in GNOME Camera. The front sensor sometimes fails its first
+  probe at boot; `q706f-camera-retry.service` rebinds it.
+- **Still open.** GNOME Web (Epiphany) can freeze or reset the tablet on
+  video; USB controller resume reports `-16` after suspend.
+
+**Developer preview.** Unlocking the bootloader wipes the tablet, and a
+flashing mistake can leave it unbootable. 7.4-rc3 is a release candidate.
+
 ## What changed since the first release (2026-11-20)
 
 - **Deep sleep works.** The SoC now reaches CX collapse (CXSD) on every suspend:
@@ -60,7 +101,8 @@ it is no longer maintained.
 
 ## Status
 
-Tested between 2026-11-13 and 2026-11-20 on Linux 7.3.4. "Confirmed" means a person checked
+Tested between 2026-11-13 and 2026-11-20 on Linux 7.3.4; rows marked "7.4" were re-checked on
+Linux 7.4-rc3 on 2026-11-23. "Confirmed" means a person checked
 the effect on the device; "SSH" means it was only verified with commands and logs.
 
 | Component | State | Notes |
@@ -68,7 +110,7 @@ the effect on the device; "SSH" means it was only verified with commands and log
 | Boot from `boot_a` / `boot_b` | ✅ | Unattended boot into GDM/GNOME; slot marked successful by a service (see below) |
 | Display 2560×1600, 120/60 Hz | ✅ | DSI panel works; 60 Hz mode switch confirmed on 7.1, not re-checked on 7.3.4 |
 | Brightness | 🟡 | Backlight control works; automatic brightness is off on purpose (fast changes can hang the panel) |
-| GPU (Adreno 650) | ✅ | Freedreno/Turnip, GNOME accelerated, Vulkan works |
+| GPU (Adreno 650) | ✅ | Freedreno/Turnip, GNOME accelerated, Vulkan works. On 7.4, `0139` (GPU DDR votes + ACD) is needed for the top GPU clock: Chrome 2160p60 confirmed |
 | Hardware video decoding | ❔ | `qcom_iris` binds; not tested |
 | Touchscreen | ✅ | |
 | Stylus (Precision Pen 3) on screen | ✅ | Pressure 0–4095, separate tablet device. `0113` switches the digitizer into pen mode; tip/hover/tilt changes of `0109` not fully confirmed |
@@ -78,18 +120,18 @@ the effect on the device; "SSH" means it was only verified with commands and log
 | On-screen keyboard | ✅ | GJS OSK in the session (`setup-gjs-osk.sh`, optional); GNOME OSK forced on the login screen (not confirmed physically) |
 | Wi-Fi (QCA6390) | ✅ | 2.4 and 5 GHz; generic board data, regulatory domain from the timezone |
 | Bluetooth | ✅ | BLE HID (the pen); BT audio not tested |
-| Speakers (4× CS35L45) | 🟡 | Sound confirmed (L/R with 7.3.4). **No protection DSP:** the Cirrus protection firmware loads but does not process audio (DSP watchdog when PipeWire starts); volume is capped in UCM, see below |
+| Speakers (4× CS35L45) | 🟡 | Confirmed loud and clean on 7.4. **No protection DSP:** the Cirrus protection firmware does not process audio on mainline. Amps at 0 dB (as stock) behind a PipeWire chain: −8 dB, +3 dB @ 220 Hz, 120 Hz high-pass, x42 limiter −9 dBTP; a WirePlumber hook blocks bypassing it |
 | Microphones (WCD938x) | 🟡 | Recording works on 7.1; on 7.3.4 the source is present, quality not judged. Far-field AS33970 array disabled on purpose |
-| Cameras (OV13B10, S5K5E9, OV8856) | 🟡 | All three in libcamera/PipeWire with the soft ISP, debayering on the GPU; colour matrices from the stock tuning (colours not confirmed); manual focus (`0114`) |
+| Cameras (OV13B10, S5K5E9, OV8856) | 🟡 | All three confirmed in GNOME Camera on 7.4 (soft ISP, GPU debayering, stock colour matrices, autofocus on the main rear). The front sensor can fail its first probe at boot; `q706f-camera-retry.service` rebinds it |
 | Power button, cover (hall sensor) | ✅ | Both wake the tablet from s2idle |
 | Volume buttons, vibration, flashlight | ❔ | Not tested; flash LED now exposed (`white:flash`), not tested |
 | Battery gauge | ✅ | bq27541: level, voltage, current, temperature; charge limit 4.25 V |
-| Charging | 🟡 | **No 45 W fast charging** (the SMB1396 charge pumps have no mainline driver): 5 V only, about 1.5 A from a wall charger, 500 mA from a PC port. Thermal charging limits are implemented (`0110`) but were not tested hot |
-| Suspend (s2idle) | ✅ | Enter/wake works (power button, cover). Deep sleep (CXSD) on every suspend with `0118` + `0121`: about 52 mA overnight. Bluetooth is off in suspend |
+| Charging | 🟡 | **9 V USB-PD confirmed on 7.4** (`0116` + `0138`): 9 V/3 A contract, about 4 A into the battery. No 45 W charging (the SMB1396 charge pumps have no mainline driver). Thermal charging limits (`0110`) not tested hot |
+| Suspend (s2idle) | ✅ | Enter/wake works (power button, cover). Deep sleep (CXSD) on every suspend with `0118` + `0121`: about 52 mA overnight (7.3.4), 55 mA (7.4). Low-power switches `0130`–`0137` on by default since 23.11; overnight figure pending. Bluetooth is off in suspend |
 | USB gadget (NCM + SSH) | ✅ | Fixed address `172.16.42.1` for development and recovery |
 | USB OTG, DisplayPort alt mode, microSD, USB-C audio | ❔ | Not tested |
 | Fingerprint reader (Goodix, in QSEE) | ❌ | Experimental QSEECOM TEE series in `scripts/desktop/patches-fp/`; not part of the normal build |
-| RTC | 🟡 | PMIC RTC is read-only; the clock is restored at boot (fake-hwclock) and by NTP |
+| RTC | 🟡 | PMIC RTC is read-only; a forward-only fake-hwclock checkpoint restores the clock at boot, NTP corrects it |
 | GPS / modem | ➖ | Wi-Fi-only model |
 | `scripts/desktop/install.sh` | ❔ | **Never run end-to-end on a tablet** (only `--dry-run` and against a simulated initramfs). The author's tablet was installed by hand, step by step |
 
@@ -97,8 +139,10 @@ Known issues and limits:
 
 - **Speakers have no protection.** On mainline the CS35L45 DACs are fed straight from the
   TDM bus; the Cirrus protection firmware (excursion/thermal limiting) is not in the path.
-  The UCM profile pins `Digital PCM Volume` to 350 (−14.75 dB) on every amplifier. Do not
-  raise it.
+  The UCM profile sets `Digital PCM Volume` to 409 (0 dB, as stock) and the overlay puts a
+  PipeWire high-pass + limiter chain in front (needs `x42-plugins` and
+  `libspa-0.2-modules-extra`; without the limiter the speaker output stays silent). Do not
+  remove the chain or raise the amp gain.
 - **Default password.** The image has one account, user `ubuntu`, password `ubuntu`
   (unless built with `USER_PASSWORD=...`), and SSH password login is enabled. Change it at
   the first boot (`install.sh post` offers to). `scripts/desktop/tools/q706f-secure.sh`
@@ -208,8 +252,8 @@ The ALSA UCM profile for this tablet was written by **chalkin (silime)** for
 has no declared licence, so the files are **not redistributed here**.
 `scripts/desktop/ucm/fetch-ucm.sh` (called by `make-rootimg.sh`) downloads them at a pinned
 commit, checks their sha256 and applies
-[`q706f-HiFi.conf.patch`](scripts/desktop/ucm/q706f-HiFi.conf.patch): the speaker volume cap
-and the internal microphones. A WirePlumber rule in the overlay forces 16-bit PCM, without
+[`q706f-HiFi.conf.patch`](scripts/desktop/ucm/q706f-HiFi.conf.patch): the speaker amp gain
+(0 dB) and the internal microphones. A WirePlumber rule in the overlay forces 16-bit PCM, without
 which the amplifiers stay silent.
 
 ## Repository layout
@@ -219,6 +263,7 @@ which the amplifiers stay silent.
 | `scripts/setup-host.sh`, `scripts/dev-shell.sh`, `scripts/docker/` | Build container (Ubuntu 22.04, cross toolchain, mkbootimg) |
 | `scripts/backup-edl.sh`, `scripts/edl.sh`, `scripts/docker-edl/` | Read-only full backup over Qualcomm EDL (bkerler/edl) |
 | `scripts/desktop/build-kernel.sh`, `kernel-cycle.sh`, `make-testboot.sh`, `make-kernel-deb.sh` | Kernel, boot image, kernel package |
+| `scripts/desktop/patches-7.4/` | Kernel series for Linux 7.4-rc3 (what the author's tablet runs) |
 | `scripts/desktop/patches/` | Kernel series for Linux 7.3.4 (+ `.pending` / `.needs-approval`) |
 | `scripts/desktop/*.config`, `config-pmos-q706f-6.11` | Kernel config: base from postmarketOS pmaports (`device-lenovo-q706f`) + fragments |
 | `scripts/desktop/build-rootfs.sh`, `rootfs-customize.sh`, `make-rootimg.sh`, `check-rootimg.sh` | Root filesystem and image |

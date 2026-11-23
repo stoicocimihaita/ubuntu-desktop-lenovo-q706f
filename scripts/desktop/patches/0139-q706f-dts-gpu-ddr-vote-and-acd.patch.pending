@@ -1,0 +1,83 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] arm64: dts: qcom: q706f: GPU DDR vote per level and ACD as stock
+
+Stock KGSL (bin 2: 670-305 MHz, same GX corners as mainline) votes DDR for
+each GPU power level before the clock change and enables ACD with per-level
+words through the AOP mailbox. The sm8250.dtsi GPU node has no interconnect
+path (no DDR vote at all) and no ACD data. Add the gfx-mem path with the
+stock LPDDR5 IB per OPP, the stock ACD words, and the AOSS QMP handle on the
+GMU. ACD can be turned off with msm.disable_acd=1.
+
+Test kernel only (22.11.2026): browser video froze the GPU (lockup without
+recovery). See docs/cercetare-gpu-2026-11-22/GPU-STOCK-VS-MAINLINE.md.
+
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+@@ -902,9 +902,53 @@
+ };
+ 
+ &gmu {
++	/* AOSS mailbox for the GPU ACD state (stock KGSL obtains the AOP mailbox for ACD) */
++	qcom,qmp = <&aoss_qmp>;
++
+ 	status = "okay";
+ };
+ 
++/*
++ * GPU levels as in the stock DT for speed bin 2 (fuse 0x19b[7:5] = 2 on this tablet):
++ * DDR peak = the stock LPDDR5 (ddr8) IB of each level, ACD words from qcom,acd-level.
++ */
++&gpu_opp_table {
++	opp-670000000 {
++		opp-peak-kBps = <10687500>;
++		qcom,opp-acd-level = <0x802b5ffd>;
++	};
++
++	opp-587000000 {
++		opp-peak-kBps = <10687500>;
++		qcom,opp-acd-level = <0x802b5ffd>;
++	};
++
++	opp-525000000 {
++		opp-peak-kBps = <6074218>;
++		qcom,opp-acd-level = <0x802b5ffd>;
++	};
++
++	opp-490000000 {
++		opp-peak-kBps = <6074218>;
++		qcom,opp-acd-level = <0xa02b5ffd>;
++	};
++
++	opp-441600000 {
++		opp-peak-kBps = <6074218>;
++		qcom,opp-acd-level = <0xa02b5ffd>;
++	};
++
++	opp-400000000 {
++		opp-peak-kBps = <6074218>;
++		qcom,opp-acd-level = <0xa02b5ffd>;
++	};
++
++	opp-305000000 {
++		opp-peak-kBps = <1761718>;
++		qcom,opp-acd-level = <0xa02b5ffd>;
++	};
++};
++
+ &gpi_dma0 {
+ 	status = "okay";
+ };
+@@ -918,6 +962,13 @@
+ };
+ 
+ &gpu {
++	/*
++	 * Stock KGSL votes DDR per GPU power level before changing the GPU clock; the
++	 * sm8250.dtsi GPU node has no interconnect path, so the GPU never voted DDR.
++	 */
++	interconnects = <&gem_noc MASTER_GRAPHICS_3D 0 &mc_virt SLAVE_EBI_CH0 0>;
++	interconnect-names = "gfx-mem";
++
+ 	status = "okay";
+ 
+ 	zap-shader {

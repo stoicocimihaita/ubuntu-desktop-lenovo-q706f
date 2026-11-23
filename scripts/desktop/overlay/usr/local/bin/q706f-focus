@@ -1,0 +1,200 @@
+#!/usr/bin/gjs -m
+// q706f-focus: one-button contrast autofocus for the rear main camera (OV13B10 with a
+// DW9768/DW9763 lens actuator, `focus_absolute` 0..1023 on its V4L2 subdevice).
+// libcamera's simple pipeline has no autofocus and never touches the actuator, so this tool
+// reads the camera stream as a second PipeWire consumer (the camera app keeps running), moves
+// the lens, and keeps the sharpest position. The last position is remembered in
+// ~/.config/q706f-focus and applied at start.
+import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
+import Gtk from 'gi://Gtk?version=4.0';
+import Adw from 'gi://Adw?version=1';
+import Gst from 'gi://Gst?version=1.0';
+
+Gst.init(null);
+
+const STATE = GLib.build_filenamev([GLib.get_user_config_dir(), 'q706f-focus']);
+const MAIN_CAMERA_NODE = 'libcamera_input._base_soc_0_cci_ac4f000_i2c-bus_0_camera_36';
+const W = 320, H = 180;
+const MAX = 1023;
+
+function findActuator() {
+    const dir = Gio.File.new_for_path('/sys/class/video4linux');
+    const it = dir.enumerate_children('standard::name', Gio.FileQueryInfoFlags.NONE, null);
+    let info;
+    while ((info = it.next_file(null)) !== null) {
+        const n = info.get_name();
+        if (!n.startsWith('v4l-subdev'))
+            continue;
+        try {
+            const [, bytes] = GLib.file_get_contents(`/sys/class/video4linux/${n}/name`);
+            if (/^(dw9768|dw9763|gt9768|dw9714)/.test(new TextDecoder().decode(bytes).trim()))
+                return `/dev/${n}`;
+        } catch (e) {
+            // ignore unreadable entries
+        }
+    }
+    return null;
+}
+
+function readSaved() {
+    try {
+        const [, bytes] = GLib.file_get_contents(STATE);
+        const v = parseInt(new TextDecoder().decode(bytes), 10);
+        return Number.isFinite(v) ? Math.min(Math.max(v, 0), MAX) : 350;
+    } catch (e) {
+        return 350;
+    }
+}
+
+function save(value) {
+    try {
+        GLib.mkdir_with_parents(GLib.get_user_config_dir(), 0o755);
+        GLib.file_set_contents(STATE, `${value}\n`);
+    } catch (e) {
+        logError(e);
+    }
+}
+
+function setFocus(dev, value) {
+    try {
+        GLib.spawn_sync(null, ['v4l2-ctl', '-d', dev, `--set-ctrl=focus_absolute=${value}`],
+            null, GLib.SpawnFlags.SEARCH_PATH, null);
+    } catch (e) {
+        logError(e);
+    }
+}
+
+// Mean squared gradient of the central half of a GRAY8 frame, normalised by the mean level.
+function sharpness(sample) {
+    const buf = sample.get_buffer();
+    const [ok, map] = buf.map(Gst.MapFlags.READ);
+    if (!ok)
+        return -1;
+    const d = map.data;
+    let g = 0, s = 0, n = 0;
+    for (let y = H / 4; y < (3 * H) / 4; y++) {
+        const row = y * W;
+        for (let x = W / 4; x < (3 * W) / 4; x++) {
+            const p = d[row + x];
+            const dx = d[row + x + 1] - p;
+            const dy = d[row + W + x] - p;
+            g += dx * dx + dy * dy;
+            s += p;
+            n++;
+        }
+    }
+    buf.unmap(map);
+    return g / n / (s / n || 1);
+}
+
+const idle = () => new Promise(r => GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+    r();
+    return GLib.SOURCE_REMOVE;
+}));
+
+async function autofocus(dev) {
+    const pipe = Gst.parse_launch(
+        `pipewiresrc target-object=${MAIN_CAMERA_NODE} ! videoconvert ! videoscale ! ` +
+        `video/x-raw,format=GRAY8,width=${W},height=${H} ! ` +
+        'appsink name=s max-buffers=1 drop=true sync=false');
+    const sink = pipe.get_by_name('s');
+    pipe.set_state(Gst.State.PLAYING);
+    const cache = new Map();
+    // Running time of the pipeline (the clock buffer timestamps are expressed in).
+    const now = () => {
+        const clock = pipe.get_clock();
+        return clock ? clock.get_time() - pipe.get_base_time() : -1;
+    };
+    // Pull the first frame whose capture started after `after` (+ one frame in flight), so a
+    // frame exposed before or during the lens move is never measured.
+    const freshSample = after => {
+        let smp = null;
+        for (let i = 0; i < 8; i++) {
+            smp = sink.emit('try-pull-sample', 400 * Gst.MSECOND);
+            if (!smp)
+                return null;
+            const pts = smp.get_buffer().pts;
+            if (after < 0 || pts === Gst.CLOCK_TIME_NONE || pts >= after)
+                return i >= 1 ? smp : (sink.emit('try-pull-sample', 400 * Gst.MSECOND) ?? smp);
+        }
+        return smp;
+    };
+    // Move the lens, wait for a frame captured after the move, measure it.
+    const measure = async (p, settleMs = 0) => {
+        if (cache.has(p))
+            return cache.get(p);
+        setFocus(dev, p);
+        if (settleMs)
+            GLib.usleep(settleMs * 1000);
+        const smp = freshSample(now());
+        const v = smp ? sharpness(smp) : -1;
+        cache.set(p, v);
+        await idle();                           // keep the window responsive
+        return v;
+    };
+    try {
+        if (!sink.emit('try-pull-sample', 5 * Gst.SECOND))
+            throw new Error('nu primesc cadre de la cameră');
+        // Coarse: walk from far to near, stop once clearly past the peak.
+        let best = -1, bestPos = 0, drops = 0;
+        for (let p = 0; p <= MAX; p += 64) {
+            // The jump to 0 can be the whole travel: let the lens settle before the first frame.
+            const v = await measure(p, p === 0 ? 300 : 0);
+            if (v > best) {
+                best = v;
+                bestPos = p;
+                drops = 0;
+            } else if (best > 0 && v < 0.6 * best && ++drops >= 2) {
+                break;
+            }
+        }
+        // Fine: linear scan in steps of 16 over ±64 around the coarse peak (a ternary search
+        // is too sensitive to frame-to-frame noise).
+        let pos = bestPos;
+        for (let p = Math.max(0, bestPos - 64); p <= Math.min(MAX, bestPos + 64); p += 16) {
+            const v = await measure(p);
+            if (v > best) {
+                best = v;
+                pos = p;
+            }
+        }
+        setFocus(dev, pos);
+        save(pos);
+        return {pos, steps: cache.size};
+    } finally {
+        pipe.set_state(Gst.State.NULL);
+    }
+}
+
+const app = new Adw.Application({application_id: 'org.q706f.Focus'});
+app.connect('activate', () => {
+    const dev = findActuator();
+    const win = new Adw.ApplicationWindow({application: app, title: 'Focus',
+        default_width: 220, resizable: false});
+    const btn = new Gtk.Button({label: 'Auto focus', css_classes: ['suggested-action', 'pill'],
+        margin_top: 14, margin_bottom: 14, margin_start: 14, margin_end: 14});
+    const handle = new Gtk.WindowHandle({child: btn});
+    win.set_content(handle);
+    if (!dev) {
+        btn.set_label('Fără motor de focus');
+        btn.set_sensitive(false);
+    } else {
+        setFocus(dev, readSaved());
+        btn.connect('clicked', () => {
+            btn.set_sensitive(false);
+            btn.set_label('Focus…');
+            const t0 = GLib.get_monotonic_time();
+            autofocus(dev).then(({pos, steps}) => {
+                const s = (GLib.get_monotonic_time() - t0) / 1e6;
+                print(`autofocus: position ${pos}, ${steps} steps, ${s.toFixed(1)} s`);
+                btn.set_label('Auto focus');
+            }).catch(e => {
+                print(`autofocus failed: ${e.message}`);
+                btn.set_label('Eroare — reîncearcă');
+            }).finally(() => btn.set_sensitive(true));
+        });
+    }
+    win.present();
+});
+app.run([]);

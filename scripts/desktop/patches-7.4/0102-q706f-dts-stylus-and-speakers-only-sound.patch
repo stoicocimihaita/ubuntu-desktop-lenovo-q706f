@@ -1,0 +1,39 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] arm64: dts: qcom: sm8250-lenovo-q706f: stylus and speakers-only sound card
+
+---
+diff --git a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+index 8417eaa60c3d82785f5083ae79c3654da1ae078b..90c3f364cdfce3ff119f7f267113e25bf53bf979 100644
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+@@ -1726,6 +1726,11 @@ touchscreen@0 {
+ 
+ 		touchscreen-size-x = <2560>;
+ 		touchscreen-size-y = <1600>;
++		touchscreen-x-mm = <271>;
++		touchscreen-y-mm = <170>;
++
++		goodix,stylus-enable;
++		goodix,stylus-pressure-level = <4096>;
+ 
+ 		pinctrl-names = "default";
+ 		pinctrl-0 = <&ts_irq>, <&ts_reset>;
+@@ -2088,3 +2093,18 @@ &venus {
+ 	firmware-name = "qcom/sm8250/q706f/venus.mbn";
+ 	status = "okay";
+ };
++
++/*
++ * Bring-up: the AS33970 microphone DSP does not answer on this unit and its
++ * driver would rewrite the DSP flash. Keep it off and drop its capture link so
++ * the sound card (speakers) can register.
++ */
++&as33970 {
++	status = "disabled";
++};
++
++&sound {
++	pinctrl-0 = <&pri_tdm_active>;
++
++	/delete-node/ senary-capture-dai-link;
++};

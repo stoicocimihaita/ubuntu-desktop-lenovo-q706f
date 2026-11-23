@@ -1,0 +1,96 @@
+drm/msm: Centralize the standalone drm device check for GPU
+
+Origin: upstream RFT series "[PATCH RFT 0/5] drm/msm: Attach a driver to GMU",
+        patch 2/5, not merged (v1; v2 announced, not seen on lore by 13.11.2026).
+        https://lore.kernel.org/all/20260513-gmu-sync-state-fix-v1-2-6e33e6aa9b4f@oss.qualcomm.com/
+        Author: Akhil P Oommen <akhilpo@oss.qualcomm.com>, Wed, 13 May 2026 02:22:57 +0530
+        Review: Reviewed-by Dmitry Baryshkov on 1/5, 3/5, 5/5; Tested-by on
+        x1e80100, sm8750, sc8280xp. Not tested on SM8250 / Adreno 650.
+Status: .pending - apply only together with the other 0203* files, for the
+        power test kernel (out/desktop/kernel-power). Rename to .patch to apply.
+
+Original commit message:
+Replace msm_gpu_no_components() with msm_gpu_use_separate_drm_dev() and
+move the platform-specific check for "amd,imageon" into the helper so the
+policy is centralized and reused by both the core driver and adreno probe
+path. No functional change intended.
+
+Signed-off-by: Akhil P Oommen <akhilpo@oss.qualcomm.com>
+
+7.4-rc3 port: v7.4 replaced msm_gpu_no_components() by the tristate
+msm_separate_gpu_kms_components() (auto mode). msm_gpu_use_separate_drm_dev() is
+added on top of it and keeps adreno_probe()'s v7.4 condition (imageon, or
+separate mode and adreno_has_gpu()); no functional change.
+
+diff --git a/drivers/gpu/drm/msm/adreno/adreno_device.c b/drivers/gpu/drm/msm/adreno/adreno_device.c
+index 7108d4aa59b5b9d6028ef24b158f13ec288935d5..84bdc33898fcb01ba39c92053ef292cdf98c025f 100644
+--- a/drivers/gpu/drm/msm/adreno/adreno_device.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_device.c
+@@ -271,10 +271,7 @@ static const struct component_ops a3xx_ops = {
+ 
+ static int adreno_probe(struct platform_device *pdev)
+ {
+-	struct device_node *node = pdev->dev.of_node;
+-
+-	if (of_device_is_compatible(node, "amd,imageon") ||
+-	    (msm_separate_gpu_kms_components() && adreno_has_gpu(node)))
++	if (msm_gpu_use_separate_drm_dev(pdev))
+ 		return msm_gpu_probe(pdev, &a3xx_ops);
+ 
+ 	return component_add(&pdev->dev, &a3xx_ops);
+diff --git a/drivers/gpu/drm/msm/msm_drv.c b/drivers/gpu/drm/msm/msm_drv.c
+index c3111deaa64680d25ba30a7261fecae04ff31c30..d6b9f53d8d11c5e3fa85b750b3728909eeff597a 100644
+--- a/drivers/gpu/drm/msm/msm_drv.c
++++ b/drivers/gpu/drm/msm/msm_drv.c
+@@ -137,6 +137,22 @@ bool msm_separate_gpu_kms_components(void)
+ 	}
+ }
+ 
++/*
++ * Whether this GPU device gets its own DRM device (no display components).
++ * With pdev == NULL: the global policy only.
++ */
++bool msm_gpu_use_separate_drm_dev(struct platform_device *pdev)
++{
++	struct device_node *node;
++
++	if (!pdev)
++		return msm_separate_gpu_kms_components();
++
++	node = pdev->dev.of_node;
++	return of_device_is_compatible(node, "amd,imageon") ||
++	       (msm_separate_gpu_kms_components() && adreno_has_gpu(node));
++}
++
+ static int msm_drm_uninit(struct device *dev, const struct component_ops *gpu_ops)
+ {
+ 	struct platform_device *pdev = to_platform_device(dev);
+@@ -1113,7 +1129,7 @@ static int add_gpu_components(struct device *dev,
+ static int msm_drm_bind(struct device *dev)
+ {
+ 	return msm_drm_init(dev,
+-			    msm_separate_gpu_kms_components() ?
++			    msm_gpu_use_separate_drm_dev(NULL) ?
+ 				    &msm_kms_driver :
+ 				    &msm_driver,
+ 			    NULL);
+@@ -1152,7 +1168,7 @@ int msm_drv_probe(struct device *master_dev,
+ 			return ret;
+ 	}
+ 
+-	if (!msm_separate_gpu_kms_components()) {
++	if (!msm_gpu_use_separate_drm_dev(NULL)) {
+ 		ret = add_gpu_components(master_dev, &match);
+ 		if (ret)
+ 			return ret;
+diff --git a/drivers/gpu/drm/msm/msm_drv.h b/drivers/gpu/drm/msm/msm_drv.h
+index 2840e8a5052d7642d9b9e45f7a6ab90ecf0be8b1..dc980c52825c1786be3dd96323a1543f68031c07 100644
+--- a/drivers/gpu/drm/msm/msm_drv.h
++++ b/drivers/gpu/drm/msm/msm_drv.h
+@@ -539,5 +539,6 @@ void msm_kms_shutdown(struct platform_device *pdev);
+ bool msm_disp_drv_should_bind(struct device *dev, bool dpu_driver);
+ 
+ bool msm_separate_gpu_kms_components(void);
++bool msm_gpu_use_separate_drm_dev(struct platform_device *pdev);
+ 
+ #endif /* __MSM_DRV_H__ */

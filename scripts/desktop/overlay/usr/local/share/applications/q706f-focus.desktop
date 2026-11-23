@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Focus cameră
+Comment=Focus manual pentru camera principală din spate
+Exec=/usr/local/bin/q706f-focus
+Icon=camera-photo-symbolic
+Categories=Utility;
+Terminal=false

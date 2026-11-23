@@ -1,0 +1,31 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] DEBUG: interconnect: qcom: bcm-voter: dump votes and stack on AMC timeout
+
+Debug only (22.11.2026): browser video at 1440p resets the tablet after
+"Error sending AMC RPMH requests (-110)". Print the AMC commands, the BCMs
+in the commit and the caller stack.
+
+--- a/drivers/interconnect/qcom/bcm-voter.c
++++ b/drivers/interconnect/qcom/bcm-voter.c
+@@ -315,7 +315,21 @@
+ 	ret = rpmh_write_batch(voter->dev, RPMH_ACTIVE_ONLY_STATE,
+ 			       cmds, commit_idx);
+ 	if (ret) {
++		int i, n = 0;
++
+ 		pr_err("Error sending AMC RPMH requests (%d)\n", ret);
++		/* q706f debug: which BCM votes did the AOP not complete, and who asked */
++		for (i = 0; i <= MAX_VCD && commit_idx[i]; i++)
++			n += commit_idx[i];
++		for (i = 0; i < n && i < MAX_BCMS; i++)
++			pr_err("q706f-bcm: amc cmd %d addr=%#x data=%#x wait=%u\n",
++			       i, cmds[i].addr, cmds[i].data, cmds[i].wait);
++		list_for_each_entry(bcm, &voter->commit_list, list)
++			pr_err("q706f-bcm: %s addr=%#x amc x=%llu y=%llu wake x=%llu y=%llu\n",
++			       bcm->name, bcm->addr,
++			       bcm->vote_x[QCOM_ICC_BUCKET_AMC], bcm->vote_y[QCOM_ICC_BUCKET_AMC],
++			       bcm->vote_x[QCOM_ICC_BUCKET_WAKE], bcm->vote_y[QCOM_ICC_BUCKET_WAKE]);
++		dump_stack();
+ 		goto out;
+ 	}
+ 

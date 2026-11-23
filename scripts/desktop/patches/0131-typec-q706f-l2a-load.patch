@@ -1,0 +1,187 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] usb: typec: allow Q706F L2A LPM when the USB2 PHY is off
+
+Preserve HPM while awake. In an opted-in s2idle cycle let the existing
+PD PHY load estimate participate in aggregation, with an HPM floor
+whenever the USB2 PHY still owns its DP/DM supply.
+
+---
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+@@ -626,6 +626,10 @@
+ 			regulator-min-microvolt = <3072000>;
+ 			regulator-max-microvolt = <3072000>;
+ 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
++			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
++						   RPMH_REGULATOR_MODE_HPM>;
++			regulator-allow-set-load;
++			qcom,q706f-l2a-load-trial;
+ 		};
+ 
+ 		vreg_l3a_0p9: ldo3 {
+--- a/drivers/usb/typec/tcpm/qcom/qcom_pmic_typec_pdphy.c
++++ b/drivers/usb/typec/tcpm/qcom/qcom_pmic_typec_pdphy.c
+@@ -10,6 +10,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+ #include <linux/regulator/consumer.h>
++#include <linux/of.h>
+ #include <linux/slab.h>
+ #include <linux/string_choices.h>
+ #include <linux/usb/pd.h>
+@@ -62,7 +63,8 @@
+ /* VDD regulator */
+ #define VDD_PDPHY_VOL_MIN		2800000	/* uV */
+ #define VDD_PDPHY_VOL_MAX		3300000	/* uV */
+-#define VDD_PDPHY_HPM_LOAD		3000	/* uA */
++#define VDD_PDPHY_LOAD			3000	/* uA, existing PD PHY estimate */
++#define Q706F_L2A_HPM_FLOOR		10000	/* uA, PLDO mode threshold */
+ 
+ /* Message Spec Rev field */
+ #define PD_MSG_HDR_REV(hdr)		(((hdr) >> 6) & 3)
+@@ -514,6 +516,13 @@
+ 	int i;
+ 	int ret;
+ 
++	/* Keep the existing HPM policy until a suspend trial relaxes it. */
++	if (of_machine_is_compatible("lenovo,q706f")) {
++		ret = regulator_set_load(pmic_typec_pdphy->vdd_pdphy,
++					 Q706F_L2A_HPM_FLOOR);
++		if (ret)
++			return ret;
++	}
+ 	ret = regulator_enable(pmic_typec_pdphy->vdd_pdphy);
+ 	if (ret)
+ 		return ret;
+@@ -550,6 +559,16 @@
+ 	regulator_disable(pmic_typec_pdphy->vdd_pdphy);
+ }
+ 
++int qcom_pmic_typec_pdphy_sleep_load(struct pmic_typec *tcpm, bool sleep)
++{
++	struct pmic_typec_pdphy *pdphy = tcpm->pmic_typec_pdphy;
++
++	if (!pdphy)
++		return 0;
++	return regulator_set_load(pdphy->vdd_pdphy,
++				  sleep ? VDD_PDPHY_LOAD : Q706F_L2A_HPM_FLOOR);
++}
++
+ int qcom_pmic_typec_pdphy_probe(struct platform_device *pdev,
+ 				struct pmic_typec *tcpm,
+ 				const struct pmic_typec_pdphy_resources *res,
+--- a/drivers/usb/typec/tcpm/qcom/qcom_pmic_typec_pdphy.h
++++ b/drivers/usb/typec/tcpm/qcom/qcom_pmic_typec_pdphy.h
+@@ -26,6 +26,8 @@
+ struct pmic_typec_pdphy;
+ 
+ extern const struct pmic_typec_pdphy_resources pm8150b_pdphy_res;
++int qcom_pmic_typec_pdphy_sleep_load(struct pmic_typec *tcpm, bool sleep);
++
+ int qcom_pmic_typec_pdphy_probe(struct platform_device *pdev,
+ 				struct pmic_typec *tcpm,
+ 				const struct pmic_typec_pdphy_resources *res,
+--- a/drivers/usb/typec/tcpm/qcom/qcom_pmic_typec.h
++++ b/drivers/usb/typec/tcpm/qcom/qcom_pmic_typec.h
+@@ -7,6 +7,7 @@
+ #define __QCOM_PMIC_TYPEC_H__
+ 
+ struct pmic_typec {
++	bool q706f_l2a_relaxed;
+ 	struct device		*dev;
+ 	struct tcpm_port	*tcpm_port;
+ 	struct tcpc_dev		tcpc;
+--- a/drivers/usb/typec/tcpm/qcom/qcom_pmic_typec.c
++++ b/drivers/usb/typec/tcpm/qcom/qcom_pmic_typec.c
+@@ -11,6 +11,7 @@
+ #include <linux/power_supply.h>
+ #include <linux/regmap.h>
+ #include <linux/slab.h>
++#include <linux/suspend.h>
+ #include <linux/usb/tcpm.h>
+ 
+ #include <drm/bridge/aux-bridge.h>
+@@ -178,9 +179,49 @@
+ };
+ MODULE_DEVICE_TABLE(of, qcom_pmic_typec_table);
+ 
++static bool l2a_sleep_lpm;
++module_param(l2a_sleep_lpm, bool, 0644);
++MODULE_PARM_DESC(l2a_sleep_lpm, "Q706F: allow load-based L2A LPM in s2idle");
++
++static int qcom_pmic_typec_suspend_late(struct device *dev)
++{
++	struct pmic_typec *tcpm = dev_get_drvdata(dev);
++	int ret;
++
++	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE ||
++	    !of_machine_is_compatible("lenovo,q706f") ||
++	    !READ_ONCE(l2a_sleep_lpm))
++		return 0;
++
++	ret = qcom_pmic_typec_pdphy_sleep_load(tcpm, true);
++	if (!ret)
++		tcpm->q706f_l2a_relaxed = true;
++	return ret;
++}
++
++static int qcom_pmic_typec_resume_early(struct device *dev)
++{
++	struct pmic_typec *tcpm = dev_get_drvdata(dev);
++	int ret;
++
++	if (!tcpm->q706f_l2a_relaxed)
++		return 0;
++
++	ret = qcom_pmic_typec_pdphy_sleep_load(tcpm, false);
++	if (!ret)
++		tcpm->q706f_l2a_relaxed = false;
++	return ret;
++}
++
++static const struct dev_pm_ops qcom_pmic_typec_pm_ops = {
++	.suspend_late = pm_sleep_ptr(qcom_pmic_typec_suspend_late),
++	.resume_early = pm_sleep_ptr(qcom_pmic_typec_resume_early),
++};
++
+ static struct platform_driver qcom_pmic_typec_driver = {
+ 	.driver = {
+ 		.name = "qcom,pmic-typec",
++		.pm = pm_ptr(&qcom_pmic_typec_pm_ops),
+ 		.of_match_table = qcom_pmic_typec_table,
+ 	},
+ 	.probe = qcom_pmic_typec_probe,
+--- a/drivers/phy/qualcomm/phy-qcom-qusb2.c
++++ b/drivers/phy/qualcomm/phy-qcom-qusb2.c
+@@ -1047,6 +1047,17 @@
+ 		return dev_err_probe(dev, ret,
+ 				     "failed to get regulator supplies\n");
+ 
++	/*
++	 * On Q706F vdda-phy-dpdm shares L2A with the PD PHY. Until
++	 * characterized, a live QUSB2 handle must keep L2A in HPM.
++	 * The core counts this load only while the handle is enabled.
++	 */
++	if (of_machine_is_compatible("lenovo,q706f")) {
++		ret = regulator_set_load(qphy->vregs[2].consumer, 10000);
++		if (ret)
++			return dev_err_probe(dev, ret, "failed to set DPDM load\n");
++	}
++
+ 	/* Get the specific init parameters of QMP phy */
+ 	qphy->cfg = of_device_get_match_data(dev);
+ 
+--- a/drivers/regulator/qcom-rpmh-regulator.c
++++ b/drivers/regulator/qcom-rpmh-regulator.c
+@@ -407,6 +407,11 @@
+ {
+ 	struct rpmh_vreg *vreg = rdev_get_drvdata(rdev);
+ 
++	/* Leave L2A's run mode unchanged when its last consumer leaves. */
++	if (!load_uA && of_property_read_bool(rdev->dev.of_node,
++					      "qcom,q706f-l2a-load-trial"))
++		return REGULATOR_MODE_NORMAL;
++
+ 	if (load_uA >= vreg->hw_data->hpm_min_load_uA)
+ 		return REGULATOR_MODE_NORMAL;
+ 	else

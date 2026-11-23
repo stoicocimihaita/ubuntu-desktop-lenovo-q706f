@@ -1,0 +1,40 @@
+diff --git a/spa/plugins/libcamera/libcamera-device.cpp b/spa/plugins/libcamera/libcamera-device.cpp
+index 2d6532f..b742406 100644
+--- a/spa/plugins/libcamera/libcamera-device.cpp
++++ b/spa/plugins/libcamera/libcamera-device.cpp
+@@ -67,11 +67,11 @@ const char *cameraLoc(const Camera& camera)
+ {
+ 	if (auto location = camera.properties().get(properties::Location)) {
+ 		switch (location.value()) {
+-		case properties::CameraLocationFront:
++		case properties::LocationFront:
+ 			return "front";
+-		case properties::CameraLocationBack:
++		case properties::LocationBack:
+ 			return "back";
+-		case properties::CameraLocationExternal:
++		case properties::LocationExternal:
+ 			return "external";
+ 		}
+ 	}
+diff --git a/spa/plugins/libcamera/libcamera-source.cpp b/spa/plugins/libcamera/libcamera-source.cpp
+index fba3d8b..2bf1aac 100644
+--- a/spa/plugins/libcamera/libcamera-source.cpp
++++ b/spa/plugins/libcamera/libcamera-source.cpp
+@@ -4,6 +4,7 @@
+ /* SPDX-FileCopyrightText: Copyright © 2021 Wim Taymans <wim.taymans@gmail.com> */
+ /* SPDX-License-Identifier: MIT */
+ 
++#include <span>
+ #include <array>
+ #include <cstddef>
+ #include <limits>
+@@ -303,7 +304,7 @@ void freeBuffers(struct impl *impl, struct port *port)
+ }
+ 
+ [[nodiscard]]
+-std::size_t count_unique_fds(libcamera::Span<const libcamera::FrameBuffer::Plane> planes)
++std::size_t count_unique_fds(std::span<const libcamera::FrameBuffer::Plane> planes)
+ {
+ 	std::size_t c = 0;
+ 	int fd = -1;

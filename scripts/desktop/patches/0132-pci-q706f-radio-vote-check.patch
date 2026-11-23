@@ -1,0 +1,82 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] PCI: qcom: check Q706F PCIe radio power-down
+
+The PCIe host owns the WLAN power sequencer vote even after 0121
+unbinds ath11k. Check the existing D3cold teardown path and retain
+the independent BT and PME wake policies. This also checks that the
+host reached the path that releases its L5A/L9A reference.
+
+---
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -2397,6 +2397,10 @@
+ 	return ret;
+ }
+ 
++static bool radio_off_check;
++module_param(radio_off_check, bool, 0644);
++MODULE_PARM_DESC(radio_off_check, "Q706F: require PCIe0 host teardown in s2idle");
++
+ static int qcom_pcie_suspend_noirq(struct device *dev)
+ {
+ 	struct qcom_pcie *pcie;
+@@ -2410,6 +2414,18 @@
+ 	if (ret)
+ 		return ret;
+ 
++	if (READ_ONCE(radio_off_check) &&
++	    pm_suspend_target_state == PM_SUSPEND_TO_IDLE &&
++	    of_machine_is_compatible("lenovo,q706f") &&
++	    of_property_read_bool(dev->of_node, "qcom,q706f-radio-host")) {
++		if (!pcie->pci->suspended) {
++			dev_warn(dev, "PCIe0 remained up; check endpoint binding and wake policy\n");
++			return -EBUSY;
++		}
++		dev_info(dev, "PCIe0 teardown ran, pwrctrl off %s\n",
++			 pcie->pci->pp.skip_pwrctrl_off ? "skipped for PME" : "requested");
++	}
++
+ 	if (pcie->pci->suspended) {
+ 		ret = icc_disable(pcie->icc_mem);
+ 		if (ret)
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+@@ -1244,6 +1244,7 @@
+ 
+ &pcie0 {
+ 	status = "okay";
++	qcom,q706f-radio-host;
+ };
+ 
+ &pcie0_phy {
+--- a/drivers/power/sequencing/pwrseq-qcom-wcn.c
++++ b/drivers/power/sequencing/pwrseq-qcom-wcn.c
+@@ -85,8 +85,11 @@
+ static int pwrseq_qcom_wcn_vregs_disable(struct pwrseq_device *pwrseq)
+ {
+ 	struct pwrseq_qcom_wcn_ctx *ctx = pwrseq_device_get_drvdata(pwrseq);
++	int ret;
+ 
+-	return regulator_bulk_disable(ctx->pdata->num_vregs, ctx->regs);
++	ret = regulator_bulk_disable(ctx->pdata->num_vregs, ctx->regs);
++	pr_debug("%pOF: last radio supply release returned %d\n", ctx->of_node, ret);
++	return ret;
+ }
+ 
+ static const struct pwrseq_unit_data pwrseq_qcom_wcn_vregs_unit_data = {
+@@ -179,6 +182,7 @@
+ 	struct pwrseq_qcom_wcn_ctx *ctx = pwrseq_device_get_drvdata(pwrseq);
+ 
+ 	gpiod_set_value_cansleep(ctx->bt_gpio, 0);
++	pr_debug("%pOF: BT enable deasserted\n", ctx->of_node);
+ 
+ 	return 0;
+ }
+@@ -213,6 +217,7 @@
+ 	struct pwrseq_qcom_wcn_ctx *ctx = pwrseq_device_get_drvdata(pwrseq);
+ 
+ 	gpiod_set_value_cansleep(ctx->wlan_gpio, 0);
++	pr_debug("%pOF: WLAN enable deasserted\n", ctx->of_node);
+ 
+ 	return 0;
+ }

@@ -8,8 +8,9 @@
 # declares no licence, so the files are not redistributed here: they are downloaded at a
 # pinned commit, checked against known sha256 sums and patched at build time.
 #
-# Local changes (q706f-HiFi.conf.patch): the speaker volume cap ('Digital PCM Volume' 350 on
-# every CS35L45 amp, -14.75 dB; the speakers have no protection DSP on mainline, keep it)
+# Local changes (q706f-HiFi.conf.patch): the speaker level ('Digital PCM Volume' 409 = 0 dB on
+# every CS35L45 amp, as stock; the speakers have no protection DSP on mainline, so the overlay's
+# PipeWire filter-chain 60-q706f-speaker-headroom.conf must stay in front)
 # and the internal microphones as a UCM capture device.
 #
 # Usage: scripts/desktop/ucm/fetch-ucm.sh [output dir]   (default: out/desktop/ucm)
@@ -38,10 +39,10 @@ if [ "$COMMIT" = 925004cd9484f8a44e03fddf5ab3bdb5f970865b ]; then
 else
   echo "WARNING: SILIME_UCM_COMMIT=$COMMIT is not the pinned commit: sha256 not checked" >&2
 fi
-# -F0: any context mismatch is an error (the volume cap must not be silently lost).
+# -F0: any context mismatch is an error (the speaker level must not be silently changed).
 patch -d "$DL" -p1 -F0 -s --no-backup-if-mismatch < "$PATCH"
-grep -c "Digital PCM Volume' 350" "$DL/Lenovo/q706f/HiFi.conf" | grep -qx 4 \
-  || { echo "ERROR: volume cap missing from the patched HiFi.conf" >&2; exit 1; }
+grep -c "Digital PCM Volume' 409" "$DL/Lenovo/q706f/HiFi.conf" | grep -qx 4 \
+  || { echo "ERROR: speaker level missing from the patched HiFi.conf" >&2; exit 1; }
 
 mkdir -p "$OUT/usr/share/alsa"
 mv "$DL" "$OUT/usr/share/alsa/ucm2"

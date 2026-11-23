@@ -1,0 +1,55 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] clk: qcom: add a read-only Q706F XO suspend audit
+
+Report the regular and active-only XO votes at suspend late. Correlate
+them with the TCS trace because this snapshot precedes final entry.
+
+---
+--- a/drivers/clk/qcom/clk-rpmh.c
++++ b/drivers/clk/qcom/clk-rpmh.c
+@@ -10,6 +10,7 @@
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/string_choices.h>
++#include <linux/suspend.h>
+ #include <soc/qcom/cmd-db.h>
+ #include <soc/qcom/rpmh.h>
+ #include <soc/qcom/tcs.h>
+@@ -1126,10 +1127,37 @@
+ };
+ MODULE_DEVICE_TABLE(of, clk_rpmh_match_table);
+ 
++static bool xo_sleep_audit;
++module_param(xo_sleep_audit, bool, 0644);
++MODULE_PARM_DESC(xo_sleep_audit, "Q706F: log the APPS XO clock state at suspend late");
++
++static int clk_rpmh_suspend_late(struct device *dev)
++{
++	const struct clk_rpmh_desc *desc = of_device_get_match_data(dev);
++	struct clk_rpmh *xo;
++
++	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE ||
++	    !READ_ONCE(xo_sleep_audit) || desc != &clk_rpmh_sm8250 ||
++	    !of_machine_is_compatible("lenovo,q706f"))
++		return 0;
++
++	xo = to_clk_rpmh(desc->clks[RPMH_CXO_CLK]);
++	guard(mutex)(&rpmh_clk_lock);
++	dev_info(dev, "%s @ %#x: normal mask=%#x ao mask=%#x last sent mask=%#x\n",
++		 xo->res_name, xo->res_addr, xo->state, xo->peer->state,
++		 xo->last_sent_aggr_state);
++	return 0;
++}
++
++static const struct dev_pm_ops clk_rpmh_pm_ops = {
++	.suspend_late = pm_sleep_ptr(clk_rpmh_suspend_late),
++};
++
+ static struct platform_driver clk_rpmh_driver = {
+ 	.probe		= clk_rpmh_probe,
+ 	.driver		= {
+ 		.name	= "clk-rpmh",
++		.pm	= pm_ptr(&clk_rpmh_pm_ops),
+ 		.of_match_table = clk_rpmh_match_table,
+ 	},
+ };

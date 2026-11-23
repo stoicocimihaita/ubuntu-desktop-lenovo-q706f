@@ -1,10 +1,13 @@
 q706f changes to the ALSA UCM profile of silime/ubuntu-lenovo-q706f
 (alsa-lenovo-q706f/usr/share/alsa/ucm2/Lenovo/q706f/HiFi.conf, author chalkin).
 
-1. Speaker volume cap: 'SPKn Digital PCM Volume' = 350 (-14.75 dB) on all four
-   CS35L45 amplifiers. On mainline the DAC is fed straight from ASP_RX; the
-   Cirrus protection DSP (excursion/thermal limiting) is not in the path, so
-   the cap is the only thing protecting the speakers. Keep it.
+1. Speaker level: 'SPKn Digital PCM Volume' = 409 (0 dB, as in stock Android) on
+   all four CS35L45 amplifiers. On mainline the DAC is fed straight from ASP_RX;
+   the Cirrus protection DSP (excursion/thermal limiting) is not in the path.
+   The overlay puts a PipeWire filter-chain in front (-8 dB headroom, high-pass,
+   limiter: /etc/pipewire/filter-chain.conf.d/60-q706f-speaker-headroom.conf)
+   because the amplifier inputs saturated above ~75 % volume. Do not raise it
+   and do not remove the filter: the speakers have no protection.
 2. Internal microphones: SectionDevice "Mic" (WCD938x AMIC1 + AMIC3 through
    the TX macro, TX_CODEC_DMA_TX_3 -> MultiMedia2), gains as in the stock
    Android mixer_paths.
@@ -17,9 +20,9 @@ Applied by scripts/desktop/ucm/fetch-ucm.sh with `patch -p1` inside ucm2/.
 +# Source: https://github.com/silime/ubuntu-lenovo-q706f (alsa-lenovo-q706f) by chalkin (silime),
 +# downloaded and patched at image build time by scripts/desktop/ucm/fetch-ucm.sh.
 +# Local changes (scripts/desktop/ucm/q706f-HiFi.conf.patch):
-+#  - 'Digital PCM Volume' pinned to 350 (-14.75 dB) on every amp, because the DAC is fed
-+#    straight from ASP_RX (the protection DSP is not in the path). Do not raise it: the
-+#    speakers have no excursion/thermal protection.
++#  - 'Digital PCM Volume' = 409 (0 dB, as stock) on every amp, with an 8 dB digital
++#    pre-attenuation in front (PipeWire filter-chain 60-q706f-speaker-headroom.conf). The DAC
++#    is fed straight from ASP_RX: the speakers have no excursion/thermal protection.
 +#  - internal microphones (WCD938x) added as a capture device.
 +# Needs 16-bit PCM on the front end: see /etc/wireplumber/wireplumber.conf.d/51-q706f-audio-format.conf
  # Use case configuration for Xiaoxin Pad Pro 12.6
@@ -40,7 +43,7 @@ Applied by scripts/desktop/ucm/fetch-ucm.sh with `patch -p1` inside ucm2/.
  		cset "name='SPK1 DSP_RX6 Source' VDD_BSTMON"
  		cset "name='SPK1 DSP_RX7 Source' CLASSH_TGT"
  		cset "name='SPK1 Analog PCM Volume' 3"
-+		cset "name='SPK1 Digital PCM Volume' 350"
++		cset "name='SPK1 Digital PCM Volume' 409"
  
  		cset "name='SPK2 DSP1 Firmware' Protection"
  		cset "name='SPK2 DSP1 Preload Switch' 1"
@@ -48,7 +51,7 @@ Applied by scripts/desktop/ucm/fetch-ucm.sh with `patch -p1` inside ucm2/.
  		cset "name='SPK2 DSP_RX6 Source' VDD_BSTMON"
  		cset "name='SPK2 DSP_RX7 Source' CLASSH_TGT"
  		cset "name='SPK2 Analog PCM Volume' 3"
-+		cset "name='SPK2 Digital PCM Volume' 350"
++		cset "name='SPK2 Digital PCM Volume' 409"
  
  		cset "name='SPK3 DSP1 Firmware' Protection"
  		cset "name='SPK3 DSP1 Preload Switch' 1"
@@ -56,7 +59,7 @@ Applied by scripts/desktop/ucm/fetch-ucm.sh with `patch -p1` inside ucm2/.
  		cset "name='SPK3 DSP_RX6 Source' VDD_BSTMON"
  		cset "name='SPK3 DSP_RX7 Source' CLASSH_TGT"
  		cset "name='SPK3 Analog PCM Volume' 3"
-+		cset "name='SPK3 Digital PCM Volume' 350"
++		cset "name='SPK3 Digital PCM Volume' 409"
  
  
  		cset "name='SPK4 DSP1 Firmware' Protection"
@@ -64,7 +67,7 @@ Applied by scripts/desktop/ucm/fetch-ucm.sh with `patch -p1` inside ucm2/.
  		cset "name='SPK4 DSP_RX6 Source' VDD_BSTMON"
  		cset "name='SPK4 DSP_RX7 Source' CLASSH_TGT"
  		cset "name='SPK4 Analog PCM Volume' 3"
-+		cset "name='SPK4 Digital PCM Volume' 350"
++		cset "name='SPK4 Digital PCM Volume' 409"
  
  		cset "name='PRIMARY_TDM_RX_0 Audio Mixer MultiMedia1' 1"
 +		cset "name='MultiMedia2 Mixer TX_CODEC_DMA_TX_3' 1"

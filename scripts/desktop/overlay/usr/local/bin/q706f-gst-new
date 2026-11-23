@@ -1,0 +1,8 @@
+#!/bin/sh
+# Run one program with the side-by-side GStreamer 1.28.9 from /opt (own plugin registry).
+G=/opt/gstreamer-1.28.9; L=$G/lib/aarch64-linux-gnu
+export LD_LIBRARY_PATH=$L${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export GST_PLUGIN_SYSTEM_PATH_1_0=$L/gstreamer-1.0
+export GST_PLUGIN_SCANNER_1_0=$G/libexec/gstreamer-1.0/gst-plugin-scanner
+export GST_REGISTRY_1_0=${HOME:-/tmp}/.cache/gstreamer-1.28.9-opt/registry.aarch64.bin
+exec "$@"

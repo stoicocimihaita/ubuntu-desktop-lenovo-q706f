@@ -3,7 +3,7 @@
 # Routes all four CS35L45 through the protection DSP (DACPCM = DSP_TX1), writes the factory CAL_R,
 # plays noise for DURATION seconds at PipeWire volume VOL, logs CSPL telemetry every 5 s and any
 # cs35l45 kernel messages, then restores the bypass routing. The amplifier ceiling
-# (Digital PCM Volume 350) is checked and never changed.
+# (Digital PCM Volume 409, 0 dB as stock) is checked and never changed.
 # Usage: q706f-spktest [DURATION=60] [VOL=0.7]
 DUR=${1:-60}; VOL=${2:-0.7}
 U=ubuntu; UID_=$(id -u $U)
@@ -14,9 +14,9 @@ WAV=/home/$U/audiodbg/noise.wav
 
 for n in 1 2 3 4; do
   v=$(g "SPK$n Digital PCM Volume")
-  [ "$v" -le 350 ] 2>/dev/null || { echo "ABORT: SPK$n Digital PCM Volume=$v (> 350)"; exit 1; }
+  [ "$v" -le 409 ] 2>/dev/null || { echo "ABORT: SPK$n Digital PCM Volume=$v (> 409)"; exit 1; }
 done
-echo "ceiling ok: Digital PCM Volume <= 350 on all amps"
+echo "ceiling ok: Digital PCM Volume <= 409 on all amps"
 /usr/local/libexec/q706f-spk-cal
 OLDVOL=$(asuser wpctl get-volume @DEFAULT_AUDIO_SINK@ | awk '{print $2}')
 START=$(date +%s)

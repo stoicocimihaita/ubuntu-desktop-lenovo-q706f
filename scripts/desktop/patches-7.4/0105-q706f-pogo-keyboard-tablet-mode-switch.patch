@@ -1,0 +1,293 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] HID: Lenovo Tab P12 Pro pogo keyboard: SW_TABLET_MODE switch
+
+The Tab P12 Pro (TB-Q706F) has no keyboard-detect GPIO (checked in the stock
+DT overlay and in the Lenovo downstream kernel): the pogo keyboard hangs off
+a host MCU that is always present as I2C-HID 17EF:6127 (and 04F3:31F3 for
+the touchpad).  Attach/detach is announced in a vendor input report (ID 6),
+bit 0 of the first payload byte = keyboard online.  So this cannot be a
+gpio-keys node in the DTS; it needs a small HID driver.
+
+- hid-lenovo-q706f-kbd: input device with SW_TABLET_MODE = !online.
+- i2c-hid: the MCU sends that report once ~10 ms after reset, i.e. during
+  probe, and i2c-hid drops everything until the device is opened.  Add
+  I2C_HID_QUIRK_REPLAY_EARLY_REPORT (set for 17EF:6127) which keeps the last
+  such report and delivers it on the first open.
+
+With the switch present Mutter/libinput enable auto-rotation and the
+on-screen keyboard only while the keyboard is detached.  Needs
+CONFIG_HID_LENOVO_Q706F_KBD=m.  The userspace stand-in
+(q706f-tablet-mode.service) stops itself when this driver is bound.
+
+Compile-tested only (W=1, arm64, as external objects against the 7.1 build).
+
+diff --git a/drivers/hid/Kconfig b/drivers/hid/Kconfig
+index 2481bc01c435b1305aa6666a6f94471635a8f6a0..6b2f706e0601716db91285d7eeb41e7d89584b24 100644
+--- a/drivers/hid/Kconfig
++++ b/drivers/hid/Kconfig
+@@ -641,6 +641,17 @@ config HID_LENOVO_GO
+ 	and Legion Go 2 Handheld Console Controllers. Say M here to compile this
+ 	driver as a module. The module will be called hid-lenovo-go.
+ 
++config HID_LENOVO_Q706F_KBD
++	tristate "Lenovo Tab P12 Pro (TB-Q706F) pogo keyboard dock switch"
++	depends on I2C_HID_CORE
++	help
++	Reports whether the detachable pogo keyboard of the Lenovo Tab P12 Pro
++	is attached as an SW_TABLET_MODE switch, so that user space can
++	enable auto-rotation and the on-screen keyboard when it is not.
++
++	To compile this driver as a module, choose M here: the module will
++	be called hid-lenovo-q706f-kbd.
++
+ config HID_LENOVO_GO_S
+ 	tristate "HID Driver for Lenovo Legion Go S Controller"
+ 	depends on USB_HID
+diff --git a/drivers/hid/Makefile b/drivers/hid/Makefile
+index 43a8eb0f389b18566322baa48ed8d5f9cc934bcd..9eb6e72de975819e9b7e8bef16007b71974654e6 100644
+--- a/drivers/hid/Makefile
++++ b/drivers/hid/Makefile
+@@ -78,6 +78,7 @@ obj-$(CONFIG_HID_LCPOWER)	+= hid-lcpower.o
+ obj-$(CONFIG_HID_LENOVO)	+= hid-lenovo.o
+ obj-$(CONFIG_HID_LENOVO_GO)	+= hid-lenovo-go.o
+ obj-$(CONFIG_HID_LENOVO_GO_S)	+= hid-lenovo-go-s.o
++obj-$(CONFIG_HID_LENOVO_Q706F_KBD)	+= hid-lenovo-q706f-kbd.o
+ obj-$(CONFIG_HID_LETSKETCH)	+= hid-letsketch.o
+ obj-$(CONFIG_HID_LOGITECH)	+= hid-logitech.o
+ obj-$(CONFIG_HID_LOGITECH)	+= hid-lg-g15.o
+diff --git a/drivers/hid/hid-lenovo-q706f-kbd.c b/drivers/hid/hid-lenovo-q706f-kbd.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..4d3ab2040368af88262738940bdefad35ea84620
+--- /dev/null
++++ b/drivers/hid/hid-lenovo-q706f-kbd.c
+@@ -0,0 +1,133 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Lenovo Tab P12 Pro (TB-Q706F) pogo keyboard: tablet mode switch
++ *
++ * The detachable keyboard is connected through a host MCU that is always
++ * present as an I2C-HID device (17EF:6127), whether or not a keyboard is
++ * attached, and there is no detect GPIO. The MCU announces attach/detach in
++ * a vendor defined input report (ID 6): byte 1 is a status bitmap, as used
++ * by the Lenovo downstream kernel:
++ *
++ *   bit 0    keyboard online
++ *   bit 3    cradle connected
++ *   bit 4-5  keyboard state (0 working, 1 sleeping, 2 stopped)
++ *   bit 6    touchpad suspended
++ *   bit 7    keyboard hall sensor (folio closed)
++ *
++ * Expose "keyboard not attached" as SW_TABLET_MODE. The MCU sends the report
++ * once right after reset, which is before the HID device can be opened;
++ * i2c-hid replays it on open (I2C_HID_QUIRK_REPLAY_EARLY_REPORT).
++ */
++
++#include <linux/bits.h>
++#include <linux/device.h>
++#include <linux/hid.h>
++#include <linux/input.h>
++#include <linux/module.h>
++
++#include "hid-ids.h"
++
++#define Q706F_KBD_STATUS_REPORT		0x06
++#define Q706F_KBD_STATUS_ONLINE		BIT(0)
++
++struct q706f_kbd {
++	struct input_dev *sw;
++};
++
++static int q706f_kbd_raw_event(struct hid_device *hdev,
++			       struct hid_report *report, u8 *data, int size)
++{
++	struct q706f_kbd *kbd = hid_get_drvdata(hdev);
++
++	if (report->id != Q706F_KBD_STATUS_REPORT || size < 2)
++		return 0;
++
++	input_report_switch(kbd->sw, SW_TABLET_MODE,
++			    !(data[1] & Q706F_KBD_STATUS_ONLINE));
++	input_sync(kbd->sw);
++
++	return 0;
++}
++
++static int q706f_kbd_probe(struct hid_device *hdev,
++			   const struct hid_device_id *id)
++{
++	struct q706f_kbd *kbd;
++	int ret;
++
++	kbd = devm_kzalloc(&hdev->dev, sizeof(*kbd), GFP_KERNEL);
++	if (!kbd)
++		return -ENOMEM;
++
++	kbd->sw = devm_input_allocate_device(&hdev->dev);
++	if (!kbd->sw)
++		return -ENOMEM;
++
++	kbd->sw->name = "Lenovo Tab P12 Pro keyboard dock";
++	kbd->sw->phys = hdev->phys;
++	kbd->sw->id.bustype = hdev->bus;
++	kbd->sw->id.vendor = hdev->vendor;
++	kbd->sw->id.product = hdev->product;
++	input_set_capability(kbd->sw, EV_SW, SW_TABLET_MODE);
++	/* No keyboard until the MCU says otherwise. */
++	__set_bit(SW_TABLET_MODE, kbd->sw->sw);
++
++	hid_set_drvdata(hdev, kbd);
++
++	ret = input_register_device(kbd->sw);
++	if (ret)
++		return ret;
++
++	ret = hid_parse(hdev);
++	if (ret)
++		return ret;
++
++	/*
++	 * The status report is replayed by the first open of the device,
++	 * which can be ours below or an evdev/hidraw client racing with it:
++	 * allow input reports from here on.
++	 */
++	hid_device_io_start(hdev);
++
++	ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
++	if (ret)
++		goto err_io_stop;
++
++	/* Keep the device open so that status reports are always delivered. */
++	ret = hid_hw_open(hdev);
++	if (ret)
++		goto err_hw_stop;
++
++	return 0;
++
++err_hw_stop:
++	hid_hw_stop(hdev);
++err_io_stop:
++	hid_device_io_stop(hdev);
++	return ret;
++}
++
++static void q706f_kbd_remove(struct hid_device *hdev)
++{
++	hid_hw_close(hdev);
++	hid_hw_stop(hdev);
++}
++
++static const struct hid_device_id q706f_kbd_ids[] = {
++	{ HID_I2C_DEVICE(USB_VENDOR_ID_LENOVO,
++			 I2C_DEVICE_ID_LENOVO_Q706F_KEYBOARD) },
++	{ }
++};
++MODULE_DEVICE_TABLE(hid, q706f_kbd_ids);
++
++static struct hid_driver q706f_kbd_driver = {
++	.name = "lenovo-q706f-kbd",
++	.id_table = q706f_kbd_ids,
++	.probe = q706f_kbd_probe,
++	.remove = q706f_kbd_remove,
++	.raw_event = q706f_kbd_raw_event,
++};
++module_hid_driver(q706f_kbd_driver);
++
++MODULE_DESCRIPTION("Lenovo Tab P12 Pro pogo keyboard tablet mode switch");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/hid/i2c-hid/i2c-hid-core.c b/drivers/hid/i2c-hid/i2c-hid-core.c
+index 6a54b331222c537e5e5c2c7f4664dced826a04e0..5d99a35e40a349d730409d020df9696299b53464 100644
+--- a/drivers/hid/i2c-hid/i2c-hid-core.c
++++ b/drivers/hid/i2c-hid/i2c-hid-core.c
+@@ -53,6 +53,7 @@
+ #define I2C_HID_QUIRK_DELAY_WAKEUP_AFTER_RESUME BIT(6)
+ #define I2C_HID_QUIRK_RE_POWER_ON		BIT(7)
+ #define I2C_HID_QUIRK_KEEP_POWER_ON_SUSPEND	BIT(8)
++#define I2C_HID_QUIRK_REPLAY_EARLY_REPORT	BIT(9)
+ 
+ /* Command opcodes */
+ #define I2C_HID_OPCODE_RESET			0x01
+@@ -111,6 +112,10 @@ struct i2c_hid {
+ 	struct mutex		cmd_lock;	/* protects cmdbuf and rawbuf */
+ 	struct mutex		reset_lock;
+ 
++	struct mutex		early_lock;	/* protects early_report */
++	u8			*early_report;	/* last report seen before open */
++	u32			early_report_len;
++
+ 	struct i2chid_ops	*ops;
+ 	struct drm_panel_follower panel_follower;
+ 	struct work_struct	panel_follower_work;
+@@ -167,7 +172,8 @@ static const struct i2c_hid_quirks {
+ 		I2C_HID_QUIRK_KEEP_POWER_ON_SUSPEND },
+ 	/* The Q706F keyboard MCU is subject to the same cover power domain. */
+ 	{ USB_VENDOR_ID_LENOVO, I2C_DEVICE_ID_LENOVO_Q706F_KEYBOARD,
+-		I2C_HID_QUIRK_KEEP_POWER_ON_SUSPEND },
++		I2C_HID_QUIRK_KEEP_POWER_ON_SUSPEND |
++		I2C_HID_QUIRK_REPLAY_EARLY_REPORT },
+ 	{ 0, 0 }
+ };
+ 
+@@ -597,6 +603,22 @@ static void i2c_hid_get_input(struct i2c_hid *ihid)
+ 				      ihid->inbuf + sizeof(__le16),
+ 				      ihid->bufsize - sizeof(__le16),
+ 				      ret_size - sizeof(__le16), 1);
++	} else if (ihid->quirks & I2C_HID_QUIRK_REPLAY_EARLY_REPORT) {
++		/*
++		 * Some devices report their state once, right after reset,
++		 * i.e. before anybody can have opened the HID device. Keep
++		 * the last such report and deliver it on the first open.
++		 */
++		u32 len = ret_size - sizeof(__le16);
++		u8 *copy = kmemdup(ihid->inbuf + sizeof(__le16), len, GFP_KERNEL);
++
++		if (copy) {
++			mutex_lock(&ihid->early_lock);
++			kfree(ihid->early_report);
++			ihid->early_report = copy;
++			ihid->early_report_len = len;
++			mutex_unlock(&ihid->early_lock);
++		}
+ 	}
+ 
+ 	return;
+@@ -640,6 +662,8 @@ static void i2c_hid_free_buffers(struct i2c_hid *ihid)
+ 	kfree(ihid->inbuf);
+ 	kfree(ihid->rawbuf);
+ 	kfree(ihid->cmdbuf);
++	kfree(ihid->early_report);
++	ihid->early_report = NULL;
+ 	ihid->inbuf = NULL;
+ 	ihid->rawbuf = NULL;
+ 	ihid->cmdbuf = NULL;
+@@ -867,7 +891,23 @@ static int i2c_hid_open(struct hid_device *hid)
+ 	struct i2c_client *client = hid->driver_data;
+ 	struct i2c_hid *ihid = i2c_get_clientdata(client);
+ 
++	u8 *early;
++	u32 early_len;
++
+ 	set_bit(I2C_HID_STARTED, &ihid->flags);
++
++	mutex_lock(&ihid->early_lock);
++	early = ihid->early_report;
++	early_len = ihid->early_report_len;
++	ihid->early_report = NULL;
++	mutex_unlock(&ihid->early_lock);
++
++	if (early) {
++		hid_safe_input_report(hid, HID_INPUT_REPORT, early, early_len,
++				      early_len, 1);
++		kfree(early);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1284,6 +1324,7 @@ int i2c_hid_core_probe(struct i2c_client *client, struct i2chid_ops *ops,
+ 	init_waitqueue_head(&ihid->wait);
+ 	mutex_init(&ihid->cmd_lock);
+ 	mutex_init(&ihid->reset_lock);
++	mutex_init(&ihid->early_lock);
+ 	INIT_WORK(&ihid->panel_follower_work, ihid_core_panel_follower_work);
+ 
+ 	/* we need to allocate the command buffer without knowing the maximum

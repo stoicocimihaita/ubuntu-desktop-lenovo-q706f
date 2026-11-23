@@ -1,0 +1,61 @@
+#!/bin/sh
+set -eu
+export LC_ALL=C
+
+state=/etc/fake-hwclock.data
+# Keep the same lower bound and UTC file format as the shipped package.
+minimum=1720915200
+
+read_checkpoint() {
+    IFS= read -r stamp < "$state" || return 1
+    case "$stamp" in
+        ????-??-??\ ??:??:??) ;;
+        *) return 1 ;;
+    esac
+    parsed=$(date -u -d "$stamp" '+%s %Y-%m-%d %H:%M:%S' 2>/dev/null) || return 1
+    [ "${parsed#* }" = "$stamp" ] || return 1
+    epoch=${parsed%% *}
+    [ "$epoch" -ge "$minimum" ] || return 1
+    printf '%s\n' "$epoch"
+}
+
+case "${1-}" in
+    load)
+        before=$(date -u '+%s')
+        if [ ! -e "$state" ]; then
+            printf 'q706f clock load: missing checkpoint before_epoch=%s\n' "$before"
+        elif ! saved=$(read_checkpoint); then
+            printf 'q706f clock load: invalid checkpoint before_epoch=%s\n' "$before" >&2
+        elif [ "$saved" -gt "$before" ]; then
+            date -u -s "@$saved" >/dev/null
+            printf 'q706f clock load: advanced before_epoch=%s saved_epoch=%s\n' "$before" "$saved"
+        else
+            printf 'q706f clock load: kept before_epoch=%s saved_epoch=%s\n' "$before" "$saved"
+        fi
+        printf 'q706f clock load: after_epoch=%s\n' "$(date -u '+%s')"
+        ;;
+    save)
+        sample=$(date -u '+%s %Y-%m-%d %H:%M:%S')
+        now=${sample%% *}
+        if [ "$now" -lt "$minimum" ]; then
+            printf 'q706f clock save: skipped implausible epoch=%s\n' "$now" >&2
+            exit 0
+        fi
+        if [ -e "$state" ] && saved=$(read_checkpoint) && [ "$now" -lt "$saved" ]; then
+            printf 'q706f clock save: kept newer checkpoint epoch=%s\n' "$saved"
+            exit 0
+        fi
+
+        tmp=$(mktemp "$state.XXXXXX")
+        trap 'rm -f -- "$tmp"' 0
+        trap 'exit 1' HUP INT TERM
+        printf '%s\n' "${sample#* }" > "$tmp"
+        mv -fT -- "$tmp" "$state"
+        trap - 0 HUP INT TERM
+        printf 'q706f clock save: wrote epoch=%s\n' "$now"
+        ;;
+    *)
+        printf 'Usage: %s load|save\n' "$0" >&2
+        exit 2
+        ;;
+esac

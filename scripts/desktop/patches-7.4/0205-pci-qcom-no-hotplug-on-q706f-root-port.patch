@@ -1,0 +1,33 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] PCI: qcom: do not advertise hot-plug on the q706f root port
+
+The only device behind the SM8250 PCIe0 root port is the soldered QCA6390.
+The root port advertises Hot-Plug Capable; with CONFIG_HOTPLUG_PCI_PCIE unset,
+pciehp_is_native() is false, so pci_bridge_d3_possible() refuses D3 for the
+port (before pcie_port_pm=force is even looked at). In s2idle
+dw_pcie_suspend_noirq() then sees pci_host_common_d3cold_possible() == false,
+keeps the link in L0/L1 and the controller clocks (aux, refgen <- GPLL0/CXO)
+stay on, holding a CXO vote: no SoC deep sleep (cxsd/aosd/ddr stay 0).
+
+Status: in the series (B3af and later).
+
+diff --git a/drivers/pci/controller/dwc/pcie-qcom.c b/drivers/pci/controller/dwc/pcie-qcom.c
+index b32f8aed1eb80edc65d145e23d768fd8bd108407..03c4f394ab0710dd574f31e90280d3932bbbb86c 100644
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -417,6 +417,15 @@ static void qcom_pcie_set_slot_cap(struct dw_pcie *pci)
+ 	 * Attention Button Present in Slot Capabilities.
+ 	 */
+ 	val &= ~PCI_EXP_SLTCAP_ABP;
++
++	/*
++	 * q706f: the only device (QCA6390 Wi-Fi) is soldered down. A Root Port
++	 * that advertises Hot-Plug Capable while pciehp is not built is never
++	 * allowed into D3 (pci_bridge_d3_possible()), so the host never sends
++	 * PME_Turn_Off / enters L2 in suspend and the controller clocks keep
++	 * a CXO vote. Do not advertise hot-plug.
++	 */
++	val &= ~(PCI_EXP_SLTCAP_HPC | PCI_EXP_SLTCAP_HPS);
+ 	writel(val, pci->dbi_base + offset + PCI_EXP_SLTCAP);
+ 
+ 	dw_pcie_dbi_ro_wr_dis(pci);

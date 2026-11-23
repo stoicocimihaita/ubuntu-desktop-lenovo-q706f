@@ -1,0 +1,50 @@
+Mesa @VER@ for Adreno (freedreno + turnip), installed under @PREFIX@
+=====================================================================
+
+Built for Ubuntu 26.04 arm64 (Lenovo Tab P12 Pro, SM8250 / Adreno 650, msm KMD).
+Drivers: Gallium freedreno (OpenGL / OpenGL ES 2/3 via EGL, GLX, GBM) and Vulkan turnip.
+No LLVM, no video codecs, no tools. Built with glvnd: it ships libEGL_mesa / libGLX_mesa,
+while libEGL.so.1 / libGLESv2.so.2 / libGL.so.1 / libGLX.so.0 come from the system glvnd.
+
+This tree does NOT replace the system Mesa. Nothing is read from @PREFIX@ unless the
+variables below are set for a process. GNOME Shell (mutter) and every app started
+without them keep using the system Mesa (/usr/lib/aarch64-linux-gnu).
+
+Install (as root, on the tablet):
+  tar -C / -xzf mesa-@VER@-adreno-arm64-opt.tar.gz
+Remove:
+  rm -rf @PREFIX@
+
+Environment for ONE app
+-----------------------
+  M=@PREFIX@
+  L=$M/lib/aarch64-linux-gnu
+  export LD_LIBRARY_PATH=$L${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}   # libEGL_mesa, libGLX_mesa, libgbm, libgallium-@VER@
+  export __EGL_VENDOR_LIBRARY_FILENAMES=$M/share/glvnd/egl_vendor.d/50_mesa.json   # glvnd EGL -> this Mesa only
+  export __GLX_VENDOR_LIBRARY_NAME=mesa                                     # X11/GLX apps (Xwayland): libGLX_mesa.so.0 from $L
+  export GBM_BACKENDS_PATH=$L/gbm                                           # dri_gbm.so of this build
+  export VK_DRIVER_FILES=$M/share/vulkan/icd.d/freedreno_icd.aarch64.json   # turnip only (VK_ICD_FILENAMES on old loaders)
+
+How 26.x loads the driver: libEGL_mesa / libGLX_mesa / dri_gbm.so link directly against
+libgallium-@VER@.so (freedreno is built into it); dri/*_dri.so, if present, are only for
+the X server. So LD_LIBRARY_PATH (plus the absolute library_path in 50_mesa.json) is what
+selects the driver; LIBGL_DRIVERS_PATH is not needed. The system libgallium-26.0.8.so and
+this libgallium-@VER@.so have different names, so each libEGL_mesa picks its own.
+
+Wrapper (save as ~/bin/mesa-@VER@, chmod +x), then run e.g. `mesa-@VER@ glmark2-es2-wayland`:
+  #!/bin/sh
+  M=@PREFIX@; L=$M/lib/aarch64-linux-gnu
+  export LD_LIBRARY_PATH=$L${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+  export __EGL_VENDOR_LIBRARY_FILENAMES=$M/share/glvnd/egl_vendor.d/50_mesa.json
+  export __GLX_VENDOR_LIBRARY_NAME=mesa
+  export GBM_BACKENDS_PATH=$L/gbm
+  export VK_DRIVER_FILES=$M/share/vulkan/icd.d/freedreno_icd.aarch64.json
+  exec "$@"
+
+Quick checks
+------------
+  mesa-@VER@ eglinfo -B -p wayland     # "OpenGL ES profile version string: OpenGL ES 3.2 Mesa @VER@"  (mesa-utils)
+  mesa-@VER@ vulkaninfo --summary      # driverName turnip, driverInfo "Mesa @VER@"                   (vulkan-tools)
+  mesa-@VER@ glmark2-es2-wayland       # header shows GL_VERSION ... Mesa @VER@
+  # Compare: the same command without the wrapper runs on the system Mesa 26.0.8.
+  # What a running process loaded:  grep -E 'gallium|vulkan_freedreno' /proc/<pid>/maps

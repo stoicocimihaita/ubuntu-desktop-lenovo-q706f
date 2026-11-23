@@ -1,0 +1,96 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] q706f: dts: rear camera VCM (DW9763 / GT9768) on CCI0 bus 0
+
+The ov13b10 rear module has a voice coil focus actuator, but the board DTS
+describes no lens node, so no driver binds and the lens stays at its rest
+(infinity) position: close objects are blurry.
+
+Evidence
+  Stock DT overlay (dtbo17, fragment@44 -> cam_cci0):
+    qcom,cam-sensor0 (rear, csiphy 0, cci-master 0, reset pm8009 gpio1)
+      actuator-src = <&qcom,actuator0>
+    qcom,actuator0: cci-master = <0>, cam_vaf-supply = pm8150a_l4 (PM8150L
+      LDO4, mainline vreg_l4c_1p7), 2800000 uV, 100 mA load; no GPIO.
+    cam-sensor1 (s5k5e9, rear aux) and cam-sensor2 (ov8856, front) have no
+    actuator-src: both are fixed focus.
+  Stock CAMX module configs (vendor/lib/camera):
+    com.qti.sensormodule.ofilm_ov13b10.bin: actuator "dw9763"
+      (ov13b10_dw9763_actuator, ofilm_dw9763_ov13b10)
+    com.qti.sensormodule.txd_ov13b10.bin:   actuator "gt9768"
+      (ov13b10_gt9768_actuator, txd_gt9768_ov13b10)
+    Both carry the same 10-bit actuator init, decoded (best effort) as writes to
+    registers 0x02, 0x02, 0x06, 0x07, 0x08 with data 0x02, 0x02, 0x41, 0x3f, 0x00,
+    DAC maximum 0x3ff. 0x06 = 0x41 is AAC3 + prescaler 1 (the dw9768 driver
+    defaults); 0x07 = 0x3f is the AAC timing set here.
+  Mainline: drivers/media/i2c/dw9768.c (CONFIG_VIDEO_DW9768=m, dw9768.ko is
+  installed for 7.3.4-power) drives DW9768-compatible parts; the generic
+  "dongwoon,dw9768" compatible is used so either module variant binds.
+  On 7.3.4-power: no i2c client on the CCI0 bus 0 adapter besides 0x36
+  (ov13b10), no lens entity in the media graph, vreg_l4c_1p7 unused at
+  1.808 V (no consumers).
+
+Changes
+  - vreg_l4c_1p7 fixed at 2.8 V (stock cam_vaf voltage; its only stock
+    consumers are the rear actuator/sensor/eeprom VAF).
+  - camera-lens@c on cci0_i2c0 (vin = vreg_l7f_1p8, vdd = vreg_l4c_1p7,
+    aac-timing 0x3f), linked from the ov13b10 node with lens-focus.
+
+Uncertain
+  - I2C address: the CAMX binaries were not decoded far enough to read the
+    actuator slave address. 0x0c (8-bit 0x18) is the documented address of
+    DW9763, DW9768 and GT9768. The dw9768 driver does not touch the chip at
+    probe, so a wrong address shows only as "I2C failure" / CCI NACK in dmesg
+    when focus_absolute is set or the subdev is opened.
+  - lens-focus makes the ov13b10 async notifier wait for the lens subdev:
+    if dw9768.ko is missing, the rear camera does not register.
+
+Needs a new boot image (DTB change). Not part of the normal series.
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+index 5d045f19e00dba777a381b8fbaca6e35588d1e5b..8b840443478c896e1538cd58c584f2932a2d2425 100644
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+@@ -395,6 +395,8 @@ camera_rear: camera@36 {
+ 		/* Compensate Android's portrait-based sensor orientation. */
+ 		rotation = <0>;
+ 
++		lens-focus = <&camera_rear_vcm>;
++
+ 		port {
+ 			ov13b10_rear_ep: endpoint {
+ 				data-lanes = <1 2 3 4>;
+@@ -404,6 +406,21 @@ ov13b10_rear_ep: endpoint {
+ 		};
+ 	};
+ 
++	/*
++	 * Rear module VCM. Stock CAMX: OFilm module = DW9763, TXD module =
++	 * GT9768; both are DW9768 register compatible (10-bit DAC at 0x03/0x04,
++	 * ring/AAC control at 0x02/0x06/0x07). Stock init: 0x06 = 0x41
++	 * (AAC3, prescaler 1, the driver defaults), 0x07 = 0x3f.
++	 */
++	camera_rear_vcm: camera-lens@c {
++		compatible = "dongwoon,dw9768";
++		reg = <0x0c>;
++
++		vin-supply = <&vreg_l7f_1p8>;
++		vdd-supply = <&vreg_l4c_1p7>;
++
++		dongwoon,aac-timing = <0x3f>;
++	};
+ };
+ 
+ &cci0_i2c1 {
+@@ -785,10 +802,10 @@ vreg_l3c_0p8: ldo3 {
+ 			regulator-max-microvolt = <1200000>;
+ 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+ 		};
+-		// cam
++		/* Rear camera VCM (cam_vaf of qcom,actuator0 in the stock DT): 2.8 V */
+ 		vreg_l4c_1p7: ldo4 {
+ 			regulator-name = "vreg_l4c_1p7";
+-			regulator-min-microvolt = <1800000>;
++			regulator-min-microvolt = <2800000>;
+ 			regulator-max-microvolt = <2800000>;
+ 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+ 		};

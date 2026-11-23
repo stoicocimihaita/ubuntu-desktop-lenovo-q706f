@@ -1,0 +1,58 @@
+#!/bin/sh
+# q706f-lpmrun: one timed s2idle run for the low-power experiments (0130-0137).
+# Usage (root): q706f-lpmrun <label> <seconds> [module/param ...]
+#   Sets each /sys/module/<module>/parameters/<param> to 1, arms an RTC wake after
+#   <seconds>, traces rpmh messages and suspend phases, suspends with systemctl (so
+#   the normal sleep hooks run), and after resume prints the drain (gauge charge_now),
+#   CXSD/AOSD/DDR residency and the trace location. The parameters go back to 0.
+# Needs someone next to the tablet (s2idle wake is not validated). Writes only /var/tmp/lpm-*.
+set -eu
+label=$1; secs=$2; shift 2
+P=/sys/class/power_supply/bq27541-0
+S=/sys/kernel/debug/qcom_stats
+T=/sys/kernel/tracing
+out=/var/tmp/lpm-$label
+acc() { sed -n 's/^Accumulated Duration: //p' "$S/$1"; }
+cnt() { sed -n 's/^Count: //p' "$S/$1"; }
+
+[ "$(cat /sys/class/power_supply/pm8150b-charger/online)" = 0 ] || { echo "unplug the charger first"; exit 1; }
+for p in "$@"; do
+  [ -w "/sys/module/${p%%/*}/parameters/${p#*/}" ] || { echo "no parameter $p"; exit 1; }
+  printf '1\n' > "/sys/module/${p%%/*}/parameters/${p#*/}"
+  echo "set $p=$(cat "/sys/module/${p%%/*}/parameters/${p#*/}")"
+done
+
+printf '0\n' > $T/tracing_on; : > $T/trace
+echo 16384 > $T/buffer_size_kb
+for e in rpmh/rpmh_send_msg power/suspend_resume; do printf '1\n' > "$T/events/$e/enable"; done
+printf '1\n' > $T/tracing_on
+
+c0=$(cat $P/charge_now); t0=$(date +%s)
+x0=$(acc cxsd); a0=$(acc aosd); d0=$(acc ddr); n0=$(cnt cxsd)
+ok0=$(cat /sys/power/suspend_stats/success); fail0=$(cat /sys/power/suspend_stats/fail)
+rtcwake -m no -s "$secs" >/dev/null
+systemctl suspend
+# Wait for the resume (or a failed attempt).
+i=0
+while [ "$(cat /sys/power/suspend_stats/success)" = "$ok0" ] && [ "$(cat /sys/power/suspend_stats/fail)" = "$fail0" ]; do
+  sleep 1; i=$((i+1)); [ $i -lt $((secs + 600)) ] || break
+done
+sleep 3
+c1=$(cat $P/charge_now); t1=$(date +%s)
+x1=$(acc cxsd); a1=$(acc aosd); d1=$(acc ddr); n1=$(cnt cxsd)
+printf '0\n' > $T/tracing_on
+cp $T/trace "$out.trace"
+for e in rpmh/rpmh_send_msg power/suspend_resume; do printf '0\n' > "$T/events/$e/enable"; done
+for p in "$@"; do printf '0\n' > "/sys/module/${p%%/*}/parameters/${p#*/}"; done
+
+el=$((t1 - t0))
+# The trace clock stops during s2idle: residency is relative to the wall-clock run.
+susp=$el
+{
+  echo "label=$label params=${*:-none} elapsed=${el}s"
+  echo "fail=$(( $(cat /sys/power/suspend_stats/fail) - fail0 )) cxsd_count=$((n1 - n0))"
+  awk -v c0="$c0" -v c1="$c1" -v el="$el" 'BEGIN {printf "drain %d uAh -> %.1f mA mean over the whole run\n", c0-c1, (c0-c1)*3.6/el}'
+  awk -v x="$((x1 - x0))" -v a="$((a1 - a0))" -v d="$((d1 - d0))" -v s="$susp" \
+    'BEGIN { if (s > 0) printf "residency of the run: cxsd %.2f%% aosd %.2f%% ddr %.2f%%\n", x/192e3/s, a/192e3/s, d/192e3/s }'
+  echo "trace: $out.trace ($(grep -c rpmh_send_msg "$out.trace") rpmh messages)"
+} | tee "$out.txt"

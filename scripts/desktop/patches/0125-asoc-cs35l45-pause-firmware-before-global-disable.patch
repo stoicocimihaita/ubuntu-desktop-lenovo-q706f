@@ -1,0 +1,43 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] ASoC: cs35l45: pause the firmware before clearing GLOBAL_EN
+
+On the Lenovo Tab P12 Pro (4x CS35L45, speaker-protection firmware
+v0.37.0, DAC fed from ASP_RX) every amplifier reported "DSP Watchdog
+Timer" a few seconds after the first short streams PipeWire opens at
+session start, and the protection firmware stayed dead until it was
+reloaded.
+
+The firmware reports RUNNING (mailbox status 0) after it is started at
+preload and runs again whenever the amplifier is enabled. When the DSP
+widget is not in the DAPM path nothing sends PAUSE, so the firmware is
+still running when GLOBAL_EN is cleared and the PLL loses BCLK; the
+watchdog then expires 3-7 s later, also when the part was sent
+HIBERNATE in between (it is not processed without a clock).
+
+Send PAUSE before clearing GLOBAL_EN while the DSP still has a clock.
+Tested: 0 watchdogs across boots and repeated streams (before: 4 at
+every boot). A single PAUSE after preload is not enough: the next stream
+starts the firmware again.
+---
+--- a/sound/soc/codecs/cs35l45.c
++++ b/sound/soc/codecs/cs35l45.c
+@@ -103,6 +103,19 @@
+ 	case SND_SOC_DAPM_PRE_PMD:
+ 		usleep_range(CS35L45_PRE_GLOBAL_DIS_US, CS35L45_PRE_GLOBAL_DIS_US + 100);
+ 
++		/*
++		 * The firmware runs whenever the amplifier is enabled, also when
++		 * the DAC is fed from ASP_RX and the DSP widget is not in the
++		 * path (so nothing sends PAUSE). Left running when GLOBAL_EN
++		 * drops and the PLL loses its reference, it trips the DSP
++		 * watchdog a few seconds later. Pause it while it still has a
++		 * clock; on the DSP path it is already paused and this is a
++		 * no-op.
++		 */
++		if (cs35l45->dsp.cs_dsp.running)
++			cs35l45_set_cspl_mbox_cmd(cs35l45, cs35l45->regmap,
++						  CSPL_MBOX_CMD_PAUSE);
++
+ 		regmap_write(cs35l45->regmap, CS35L45_GLOBAL_ENABLES, 0);
+ 		break;
+ 	default:

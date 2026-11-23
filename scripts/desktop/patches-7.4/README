@@ -1,0 +1,25 @@
+q706f (Lenovo Tab P12 Pro, SM8250) kernel series on top of Linux v7.4-rc3
+==========================================================================
+
+Experimental port of ../patches/ (the v7.3.4 series) to v7.4-rc3. The 7.3.4 series stays
+the production one; this directory is used only by ../build-kernel-7.4.sh and
+../make-testboot-7.4.sh. Details, risks and the first-boot checklist:
+../../../docs/KERNEL-7.4RC3-PORT.md
+
+Base: tag v7.4-rc3, https://git.kernel.org/torvalds/t/linux-7.4-rc3.tar.gz
+sha256 95c0eb4a051dd09983d6b7887bdd9d323559fccda163c627d398c0547b89f961
+(generated tag tarball, fetched 2026-11-22; no signed checksum list for -rc tarballs)
+
+The patches apply in file-name order with `patch -p1 -F0` on a pristine extraction. File
+names are kept identical to ../patches/ so the two series can be compared one to one
+(0002 still carries "v7.3.4" in its name). Patches whose content had to change carry a
+"7.4-rc3 port:" paragraph in their header; the others were only re-diffed (line offsets).
+
+Not carried (already in v7.4-rc3; their reverse applies cleanly):
+    0001 PCI: qcom: honor iommu-cells         (5121d76cb9dd, v7.4-rc1)
+    0201 ufs-qcom: enable only lane clocks    (f07317a8d57f, v7.4-rc1)
+    0202 sm8250 GCC GDSCs under RPMh CX       (389a0144c511, v7.4-rc1)
+The ath11k IRQ balance fix e56c9d429ba0 (evaluated and not needed on 7.3.4) is also in
+v7.4-rc3, together with the regression it fixes.
+
+*.pending / *.debug / *.needs-approval / *.rejected files of ../patches/ are not ported.

@@ -1,0 +1,124 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] q706f: accept 9 V from USB-PD chargers, charge at up to 4 A
+
+The connector only listed a 5 V sink PDO, so a PD charger (tested: OnePlus
+120 W, PDOs 9/12/15/20 V 3 A + PPS) was used at 5 V 3 A. Add 9 V 3 A; the
+PM8150B input already allows 5 V or 9-12 V (USBIN_ADAPTER_ALLOW_CFG = 7).
+
+When TCPM has a PD contract, set USBIN_ADAPTER_ALLOW_OVERRIDE to CONTINUOUS
+(vendor smblib_set_usb_pd_allowed_voltage() for a 5-9 V range), and clear it
+on removal. Without it the PMIC keeps the 5 V window seen at plug-in: 9 V
+raised USBIN_OV and AICL settled at 0.5 A (tested 22.11, the battery
+discharged on the charger). With it: 9 V contract, AICL 2.35 A, battery
++2.4 A.
+
+Raise the battery charge current to 4 A, the stock limit on the main
+charger alone (qcom,jeita-fcc-ranges-hvdcp3), and cap the warm zone
+(45-50 degC) at 3 A like the stock qcom,jeita-fcc-ranges; the cool zone is
+already limited to 1.5 A.
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+index 8b840443478c896e1538cd58c584f2932a2d2425..09d7f083de082b0fd8edd6867c2c0356ef4329e9 100644
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+@@ -83,7 +83,7 @@ battery: battery {
+ 		 * outside the 15-45 degC window and its first thermal
+ 		 * mitigation level.
+ 		 */
+-		constant-charge-current-max-microamp = <3000000>;
++		constant-charge-current-max-microamp = <4000000>;
+ 		/*
+ 		 * Vendor qcom,chg-term-current-ma = <(-1700)>: charging ends
+ 		 * once the cell is at the float voltage and takes less than
+@@ -1474,7 +1474,7 @@ &pm8150b_typec {
+ 	connector {
+ 		compatible = "usb-c-connector";
+ 
+-		op-sink-microwatt = <10000000>;
++		op-sink-microwatt = <27000000>;
+ 		power-role = "dual";
+ 		data-role = "dual";
+ 		self-powered;
+@@ -1484,10 +1484,16 @@ PDO_FIXED_DUAL_ROLE |
+ 		PDO_FIXED_USB_COMM |
+ 		PDO_FIXED_DATA_SWAP)>;
+ 
++		/*
++		 * 9 V 3 A from USB-PD chargers: the PM8150B USBIN accepts 5 V or
++		 * 9-12 V (USBIN_ADAPTER_ALLOW_CFG = 7). Higher PD levels and PPS
++		 * belong to the SMB1396 charge pumps, which have no driver here.
++		 */
+ 		sink-pdos = <PDO_FIXED(5000, 3000,
+ 		PDO_FIXED_DUAL_ROLE |
+ 		PDO_FIXED_USB_COMM |
+-		PDO_FIXED_DATA_SWAP)>;
++		PDO_FIXED_DATA_SWAP)
++		PDO_FIXED(9000, 3000, 0)>;
+ 
+ 		altmodes {
+ 			displayport {
+diff --git a/drivers/power/supply/qcom_pm8150b_charger.c b/drivers/power/supply/qcom_pm8150b_charger.c
+index dbbfbff9bc26d8554c1c4bf41313f64bf20403b7..5eda720853b23e03eeaff79d8a31c8eef9576b20 100644
+--- a/drivers/power/supply/qcom_pm8150b_charger.c
++++ b/drivers/power/supply/qcom_pm8150b_charger.c
+@@ -153,6 +153,9 @@
+ #define HVDCP_PULSE_COUNT_MAX			0x35b
+ #define HVDCP_PULSE_COUNT_MAX_QC2_MASK		GENMASK(7, 6)
+ 
++#define USBIN_ADAPTER_ALLOW_OVERRIDE		0x344
++#define USBIN_ADAPTER_ALLOW_CONTINUOUS		BIT(3)
++
+ #define USBIN_ADAPTER_ALLOW_CFG			0x360
+ #define USBIN_ADAPTER_ALLOW_MASK		GENMASK(3, 0)
+ 
+@@ -318,6 +321,12 @@
+ #define TEMP_PLAUSIBLE_MAX		1000
+ /* Vendor: 1.5 A in the cool range once the cell is above 4.2 V */
+ #define COOL_CHARGE_CURRENT_UA		1500000
++/*
++ * Vendor qcom,jeita-fcc-ranges: 3 A at 0-15 degC and 45.1-50 degC; up to 4 A
++ * in between on the main charger alone (qcom,jeita-fcc-ranges-hvdcp3), the
++ * 9.5 A of the stock profile needs the SMB1396 charge pumps.
++ */
++#define WARM_CHARGE_CURRENT_UA		3000000
+ /* Vendor qcom,jeita-fv-ranges, 45.1-50 degC */
+ #define WARM_FLOAT_VOLTAGE_UV		4200000
+ #define THERMAL_POLL_MS			10000
+@@ -735,6 +744,7 @@ static int smb5_apply_limits(struct smb5_chip *chip)
+ 		fcc_ua = min(fcc_ua, COOL_CHARGE_CURRENT_UA);
+ 		break;
+ 	case TEMP_WARM:
++		fcc_ua = min(fcc_ua, WARM_CHARGE_CURRENT_UA);
+ 		fv_uv = min(fv_uv, WARM_FLOAT_VOLTAGE_UV);
+ 		break;
+ 	case TEMP_COLD:
+@@ -802,6 +812,8 @@ static void smb5_status_change_work(struct work_struct *work)
+ 	if (!usb_online) {
+ 		/* The next source starts from the lowest limit */
+ 		smb5_set_current_limit(chip, SDP_CURRENT_UA);
++		/* Vendor FORCE_NULL on removal: back to USBIN_ADAPTER_ALLOW_CFG */
++		regmap_write(chip->regmap, chip->base + USBIN_ADAPTER_ALLOW_OVERRIDE, 0);
+ 		return;
+ 	}
+ 
+@@ -811,8 +823,19 @@ static void smb5_status_change_work(struct work_struct *work)
+ 	 * authoritative; waiting for or rerunning APSD only creates a race with
+ 	 * Type-C alternate-mode discovery and can temporarily apply an SDP ICL.
+ 	 */
+-	if (smb5_pd_current(chip, &current_ua))
++	if (smb5_pd_current(chip, &current_ua)) {
++		/*
++		 * TCPM may move VBUS anywhere between 5 V and the 9 V sink PDO.
++		 * Without an override the PMIC keeps the 5 V window it detected at
++		 * plug-in, flags 9 V as USBIN_OV and limits the input to ~0.5 A.
++		 * Vendor smblib_set_usb_pd_allowed_voltage() selects CONTINUOUS for a
++		 * PD range of 5-9 V (and for PPS).
++		 */
++		regmap_write(chip->regmap,
++			     chip->base + USBIN_ADAPTER_ALLOW_OVERRIDE,
++			     USBIN_ADAPTER_ALLOW_CONTINUOUS);
+ 		goto set_current_limit;
++	}
+ 
+ 	/* A 1.5 A or 3 A Type-C source may be loaded that far whatever BC1.2 says */
+ 	current_ua = smb5_typec_rp_current(chip);

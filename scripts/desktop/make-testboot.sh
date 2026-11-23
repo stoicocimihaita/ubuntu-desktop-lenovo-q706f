@@ -38,10 +38,11 @@ cp -a "$FW/sm8250/q706f" "$W/lib/firmware/qcom/sm8250/"
 cp -a "$FW"/goodix_*.bin "$W/lib/firmware/"
 (cd "$W" && find . | cpio -o -H newc --quiet | gzip -9) > "$ROOT/out/desktop/initramfs.cpio.gz"
 
-# EXTRA_CMDLINE="q706f.rootimg=ubuntu-desktop.img" boots the rootfs image from userdata.
+# The rootfs image from userdata (q706f.rootimg=ubuntu-desktop.img) is the default; EXTRA_CMDLINE= (set, empty)
+# drops it (bring-up initramfs only).
 # clk_ignore_unused pd_ignore_unused are no longer needed (B3af runs without them since
 # 14.11.2026); DEBUG_CMDLINE="clk_ignore_unused pd_ignore_unused" brings them back for a test.
-CMDLINE="console=tty0 ${DEBUG_CMDLINE:+$DEBUG_CMDLINE }loglevel=7 rdinit=/init ${EXTRA_CMDLINE:-}"
+CMDLINE="console=tty0 ${DEBUG_CMDLINE:+$DEBUG_CMDLINE }loglevel=7 rdinit=/init ${EXTRA_CMDLINE-q706f.rootimg=ubuntu-desktop.img}"
 NAME="${OUT_NAME:-testboot.img}"
 # Header v0 with the DTB appended to Image.gz, like pmOS device-lenovo-q706f.
 # The Lenovo ABL refuses a mainline DTB passed in the header-v2 dtb field

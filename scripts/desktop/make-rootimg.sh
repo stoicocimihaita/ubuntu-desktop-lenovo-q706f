@@ -44,7 +44,7 @@ echo "image: out/desktop/$IMG_NAME  from out/desktop/$ROOTFS_NAME  kernel $KREL 
 [ "$BRINGUP" != 1 ] || echo "WARNING: BRINGUP=1 rootfs: password-less sudo, autologin and --unsafe-mode are in this image"
 
 # ALSA UCM profile (silime/ubuntu-lenovo-q706f, not redistributed here): downloaded at a
-# pinned commit, sha256-checked and patched with the q706f speaker volume cap + microphones.
+# pinned commit, sha256-checked and patched with the q706f speaker level (409, 0 dB) + microphones.
 "$ROOT/scripts/desktop/ucm/fetch-ucm.sh" "$OUT/ucm"
 
 docker run --rm --privileged -v "$ROOT:/work" -v "$FW:/fw:ro" \
@@ -77,8 +77,8 @@ docker run --rm --privileged -v "$ROOT:/work" -v "$FW:/fw:ro" \
   # UCM profile prepared by fetch-ucm.sh (same ownership rules as the overlay).
   tar -C /work/out/desktop/ucm --owner=0 --group=0 --mode=go-w -cf - . \
     | tar -C "$R" -xf - --no-same-owner --no-overwrite-dir
-  grep -q "Digital PCM Volume. 350" "$R/usr/share/alsa/ucm2/Lenovo/q706f/HiFi.conf" \
-    || { echo "ERROR: UCM speaker volume cap missing"; exit 1; }
+  grep -q "Digital PCM Volume. 409" "$R/usr/share/alsa/ucm2/Lenovo/q706f/HiFi.conf" \
+    || { echo "ERROR: UCM speaker level missing"; exit 1; }
 
   if [ -x "$R/usr/bin/glib-compile-schemas" ]; then
     chroot "$R" glib-compile-schemas /usr/share/glib-2.0/schemas 2> "$S/schemas.err" || { cat "$S/schemas.err"; exit 1; }

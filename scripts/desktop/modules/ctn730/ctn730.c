@@ -37,6 +37,8 @@
 #include <linux/miscdevice.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/property.h>
+#include <linux/suspend.h>
 #include <linux/mutex.h>
 #include <linux/pm.h>
 #include <linux/power_supply.h>
@@ -246,6 +248,10 @@ MODULE_PARM_DESC(allow_firmware_update, "Create the update_firmware attribute (U
  * (instantiated through /sys/bus/i2c/devices/i2c-N/new_device).
  * Format: "<gpiochip label>,<line offset>".
  */
+static bool suspend_ven_off;
+module_param(suspend_ven_off, bool, 0644);
+MODULE_PARM_DESC(suspend_ven_off, "Release CTN730 VEN during system suspend");
+
 static char *enable_gpio;
 module_param(enable_gpio, charp, 0444);
 MODULE_PARM_DESC(enable_gpio, "Fallback VEN GPIO \"<chip label>,<offset>\" (active high)");
@@ -298,6 +304,8 @@ struct ctn730 {
 	int app_data_ok;
 	unsigned int send_failures;
 	bool enabled;
+	bool suspend_ven_released;
+	bool suspend_irq_masked;
 	bool removing;
 	bool have_mac;
 	bool host_ctrl_flag;
@@ -1220,9 +1228,9 @@ static void ctn730_update_firmware_work(struct work_struct *work)
  * Power control
  */
 
-static int ctn730_enable(struct ctn730 *ctn)
+static int ctn730_enable_locked(struct ctn730 *ctn)
 {
-	guard(mutex)(&ctn->power_lock);
+	lockdep_assert_held(&ctn->power_lock);
 
 	scoped_guard(mutex, &ctn->lock) {
 		if (ctn->removing)
@@ -1246,19 +1254,34 @@ static int ctn730_enable(struct ctn730 *ctn)
 	return 0;
 }
 
-static void ctn730_disable(struct ctn730 *ctn)
+static int ctn730_enable(struct ctn730 *ctn)
 {
 	guard(mutex)(&ctn->power_lock);
 
+	if (ctn->suspend_ven_released || ctn->suspend_irq_masked)
+		return -EBUSY;
+	return ctn730_enable_locked(ctn);
+}
+
+static bool ctn730_disable_locked(struct ctn730 *ctn, bool idle_only)
+{
+	lockdep_assert_held(&ctn->power_lock);
+
 	scoped_guard(mutex, &ctn->lock) {
 		if (!ctn->enabled)
-			return;
+			return false;
+		if (idle_only && (!ctn->initialized || ctn->pen.attached ||
+				  ctn->ext_cmd != EXT_CMD_NONE ||
+				  (ctn->status != ST_DETECTING && ctn->status != ST_LOST)))
+			return false;
 		ctn->enabled = false;
 		ctn->ext_cmd = EXT_CMD_NONE;
 	}
 
 	/* Not under ctn->lock: these wait for code that takes it. */
-	disable_irq(ctn->irq);
+	if (!ctn->suspend_irq_masked)
+		disable_irq(ctn->irq);
+	ctn->suspend_irq_masked = false;
 	cancel_delayed_work_sync(&ctn->boot_work);
 	cancel_delayed_work_sync(&ctn->set_work);
 	cancel_delayed_work_sync(&ctn->rf_on_work);
@@ -1274,6 +1297,16 @@ static void ctn730_disable(struct ctn730 *ctn)
 		ctn730_clear_pen(ctn);
 		ctn730_notify(ctn);
 	}
+
+	return true;
+}
+
+static void ctn730_disable(struct ctn730 *ctn)
+{
+	guard(mutex)(&ctn->power_lock);
+
+	ctn->suspend_ven_released = false;
+	ctn730_disable_locked(ctn, false);
 }
 
 /* -------------------------------------------------------------------------
@@ -2099,6 +2132,22 @@ static int ctn730_suspend(struct device *dev)
 	struct ctn730 *ctn = dev_get_drvdata(dev);
 	bool wait = false;
 
+	guard(mutex)(&ctn->power_lock);
+	if (pm_suspend_target_state == PM_SUSPEND_TO_IDLE &&
+	    READ_ONCE(suspend_ven_off) && ctn->enable_gpiod &&
+	    device_property_read_bool(dev, "nxp,q706f-allow-suspend-ven-off") &&
+	    !device_may_wakeup(dev)) {
+		scoped_guard(mutex, &ctn->lock) {
+			if (ctn->enabled && ctn->ext_cmd == EXT_CMD_UPDATE_FIRMWARE)
+				return -EBUSY;
+		}
+		ctn->suspend_ven_released = ctn730_disable_locked(ctn, true);
+		if (ctn->suspend_ven_released) {
+			dev_info(dev, "VEN released for suspend\n");
+			return 0;
+		}
+	}
+
 	/*
 	 * The chip keeps charging on its own while the host sleeps. Stop the
 	 * periodic battery level events so they do not wake the system when
@@ -2114,8 +2163,10 @@ static int ctn730_suspend(struct device *dev)
 	if (wait)
 		msleep(30);	/* let the response come in */
 
-	if (READ_ONCE(ctn->enabled))
+	if (ctn->enabled) {
 		disable_irq(ctn->irq);
+		ctn->suspend_irq_masked = true;
+	}
 
 	return 0;
 }
@@ -2124,10 +2175,17 @@ static int ctn730_resume(struct device *dev)
 {
 	struct ctn730 *ctn = dev_get_drvdata(dev);
 
-	if (!READ_ONCE(ctn->enabled))
+	guard(mutex)(&ctn->power_lock);
+	if (ctn->suspend_ven_released) {
+		ctn->suspend_ven_released = false;
+		return ctn730_enable_locked(ctn);
+	}
+
+	if (!ctn->suspend_irq_masked)
 		return 0;
 
 	/* Events latched during suspend are handled now (level IRQ). */
+	ctn->suspend_irq_masked = false;
 	enable_irq(ctn->irq);
 
 	scoped_guard(mutex, &ctn->lock) {

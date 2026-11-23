@@ -1,0 +1,131 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] drm/panel: samsung-amsa26zp01: opt in to dropping supplies
+
+Carry the 0115 probe vote handoff with a single owned supply reference.
+Keep the reference across unprepare by default. When requested, use
+normal DCS suspend and reset sequencing before releasing both supplies.
+
+---
+--- a/drivers/gpu/drm/panel/panel-samsung-amsa26zp01.c
++++ b/drivers/gpu/drm/panel/panel-samsung-amsa26zp01.c
+@@ -21,12 +21,17 @@
+ #include <drm/drm_panel.h>
+ #include <drm/drm_probe_helper.h>
+ 
++static bool power_off_on_unprepare;
++module_param(power_off_on_unprepare, bool, 0644);
++MODULE_PARM_DESC(power_off_on_unprepare, "Q706F: release panel supplies at unprepare");
++
+ struct samsung_amsa26zp01 {
+ 	struct drm_panel panel;
+ 	struct mipi_dsi_device *dsi;
+ 	struct drm_dsc_config dsc;
+ 	struct gpio_desc *reset_gpio;
+ 	struct regulator_bulk_data supplies[2];
++	bool supplies_on;
+ 	struct drm_connector *connector;
+ };
+ 
+@@ -116,13 +121,58 @@
+ 	return dsi_ctx.accum_err;
+ }
+ 
++static int samsung_amsa26zp01_enable_supplies(struct samsung_amsa26zp01 *ctx)
++{
++	int ret;
++
++	if (ctx->supplies_on)
++		return 0;
++
++	ret = regulator_bulk_enable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
++	if (!ret)
++		ctx->supplies_on = true;
++	return ret;
++}
++
++static int samsung_amsa26zp01_disable_supplies(struct samsung_amsa26zp01 *ctx)
++{
++	int ret;
++
++	if (!ctx->supplies_on)
++		return 0;
++
++	ret = regulator_bulk_disable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
++	if (!ret)
++		ctx->supplies_on = false;
++	return ret;
++}
++
++static void samsung_amsa26zp01_release_supplies(void *data)
++{
++	struct samsung_amsa26zp01 *ctx = data;
++	int ret;
++
++	ret = samsung_amsa26zp01_disable_supplies(ctx);
++	if (ret)
++		dev_warn(&ctx->dsi->dev, "failed to release supplies: %d\n", ret);
++}
++
++static bool samsung_amsa26zp01_can_power_off(void)
++{
++	return READ_ONCE(power_off_on_unprepare) &&
++	       of_machine_is_compatible("lenovo,q706f");
++}
++
+ static int samsung_amsa26zp01_prepare(struct drm_panel *panel)
+ {
+ 	struct samsung_amsa26zp01 *ctx = to_samsung_amsa26zp01(panel);
+ 	struct drm_dsc_picture_parameter_set pps;
+ 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
+ 
+-	dsi_ctx.accum_err = regulator_bulk_enable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
++	bool was_on = ctx->supplies_on;
++
++	/* The first prepare adopts the single vote acquired at probe. */
++	dsi_ctx.accum_err = samsung_amsa26zp01_enable_supplies(ctx);
+ 	if (dsi_ctx.accum_err)
+ 		return dsi_ctx.accum_err;
+ 
+@@ -138,7 +188,8 @@
+ 
+ 	if (dsi_ctx.accum_err) {
+ 		gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+-		regulator_bulk_disable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
++		if (!was_on || samsung_amsa26zp01_can_power_off())
++			samsung_amsa26zp01_release_supplies(ctx);
+ 	}
+ 
+ 	return dsi_ctx.accum_err;
+@@ -149,7 +200,8 @@
+ 	struct samsung_amsa26zp01 *ctx = to_samsung_amsa26zp01(panel);
+ 
+ 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+-	regulator_bulk_disable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
++	if (samsung_amsa26zp01_can_power_off())
++		return samsung_amsa26zp01_disable_supplies(ctx);
+ 
+ 	return 0;
+ }
+@@ -264,16 +316,20 @@
+ 		return dev_err_probe(dev, ret,
+ 				     "Failed to get vddio regulator\n");
+ 
+-	ret = regulator_bulk_enable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
++	ctx->dsi = dsi;
++	ret = samsung_amsa26zp01_enable_supplies(ctx);
+ 	if (ret)
+ 		dev_err(dev, "Failed to enable regulators: %d\n", ret);
+ 
++	ret = devm_add_action_or_reset(dev, samsung_amsa26zp01_release_supplies, ctx);
++	if (ret)
++		return ret;
++
+ 	ctx->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+ 	if (IS_ERR(ctx->reset_gpio))
+ 		return dev_err_probe(dev, PTR_ERR(ctx->reset_gpio),
+ 				     "Failed to get reset-gpios\n");
+ 
+-	ctx->dsi = dsi;
+ 	mipi_dsi_set_drvdata(dsi, ctx);
+ 
+ 	dsi->lanes = 4;

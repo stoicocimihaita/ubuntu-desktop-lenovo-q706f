@@ -1,0 +1,149 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] q706f: fix PM8150B float voltage scale, set battery charge limits
+
+qcom_pm8150b_charger programmed FLOAT_VOLTAGE_CFG with the PMI8998 scale
+(3.4875 V + 7.5 mV/LSB, +1). PM8150B uses 3.6 V + 10 mV/LSB (vendor
+smb5_pm8150b_params.fv). With no voltage-max-design-microvolt in the
+battery node the driver computed a value from -EINVAL and wrote 0x30,
+i.e. 4.08 V, which is why charging stopped at ~4.06 V. With the old
+formula a DT value of 4.49 V would have requested 0x86 = 4.94 V.
+
+- use the PM8150B scale, range-check, skip the write when the property
+  is missing;
+- program FAST_CHARGE_CURRENT_CFG (50 mA/LSB) from
+  constant-charge-current-max-microamp when present;
+- battery node: float voltage 4.25 V (what the vendor kernel uses for
+  this aged battery, gauge reg 0x30 = 4200 mV; 4.49 V is the new-cell
+  value), charge current 3.0 A, voltage-min-design 3.1 V.
+
+The driver still has no software temperature handling; only the PMIC's
+hardware JEITA (JEITA_EN_CFG) applies.
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+index aebb83ddb1a17a5e487969e7b359835d62dc43ec..53c8c038a092a65c6c023418072f79d1f20c4b5d 100644
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dts
+@@ -61,7 +61,29 @@ battery: battery {
+ 		compatible = "simple-battery";
+ 		energy-full-design-microwatt-hours = <39400000>;
+ 		charge-full-design-microamp-hours = <10200000>;
+-		voltage-min-design-microvolt = <3870000>;
++		/*
++		 * Reporting only (bq27541 has no writable data memory in
++		 * mainline). 3.87 V was the nominal voltage, not a minimum;
++		 * the vendor FG cutoff default is 3.1 V.
++		 */
++		voltage-min-design-microvolt = <3100000>;
++		/*
++		 * Charger float voltage (the only limit the pm8150b charger
++		 * took from here so far). A new cell is rated 4.49 V (vendor
++		 * qcom,max-voltage-uv), but the vendor kernel lowers the float
++		 * voltage with battery age, keyed on the gauge "charge voltage"
++		 * register (0x30): 4480 mV -> 4.49 V, 4400 -> 4.42 V,
++		 * 4350 -> 4.38 V, 4200 -> 4.25 V. This unit's gauge reads
++		 * 4200 mV (51 months), so vendor firmware charges it to 4.25 V.
++		 * Use <4490000> only for a new battery.
++		 */
++		voltage-max-design-microvolt = <4250000>;
++		/*
++		 * PM8150B alone, no SMB1396 charge pumps: the vendor limit
++		 * outside the 15-45 degC window and its first thermal
++		 * mitigation level.
++		 */
++		constant-charge-current-max-microamp = <3000000>;
+ 	};
+ 
+ 	gpio-hall-sensor {
+diff --git a/drivers/power/supply/qcom_pm8150b_charger.c b/drivers/power/supply/qcom_pm8150b_charger.c
+index 4dd1f40d4e77ac8f06ffd22ea516833f0b947f6b..ad1b15a8426f0b283b24e4bda55b9b03606f1557 100644
+--- a/drivers/power/supply/qcom_pm8150b_charger.c
++++ b/drivers/power/supply/qcom_pm8150b_charger.c
+@@ -257,8 +257,20 @@
+ #define DCP_CURRENT_UA			3300000
+ #define CURRENT_MAX_UA			DCP_CURRENT_UA
+ 
+-/* pmi8150b registers represent current in increments of 1/40th of an amp */
++/* pm8150b registers represent current in increments of 1/20th of an amp */
+ #define CURRENT_SCALE_FACTOR		50000
++
++/*
++ * PM8150B float voltage: 3.6 V + 10 mV per LSB, up to 4.79 V
++ * (vendor smb5_pm8150b_params.fv). This differs from PMI8998, which
++ * uses 3.4875 V + 7.5 mV per LSB.
++ */
++#define FLOAT_VOLTAGE_MIN_UV		3600000
++#define FLOAT_VOLTAGE_MAX_UV		4790000
++#define FLOAT_VOLTAGE_STEP_UV		10000
++
++/* PM8150B fast charge current: 50 mA per LSB (vendor smb5_pm8150b_params.fcc) */
++#define FAST_CHARGE_CURRENT_MAX_UA	8000000
+ /* clang-format on */
+ 
+ enum charger_status {
+@@ -850,6 +862,52 @@ static int smb5_init_hw(struct smb5_chip *chip)
+ 	return 0;
+ }
+ 
++static int smb5_init_battery_limits(struct smb5_chip *chip)
++{
++	struct power_supply_battery_info *info = chip->batt_info;
++	int rc;
++
++	/*
++	 * Without a valid float voltage in the battery node keep whatever the
++	 * bootloader/PMIC default is, rather than programming a bogus value.
++	 */
++	if (info->voltage_max_design_uv <= 0) {
++		dev_warn(chip->dev,
++			 "no voltage-max-design-microvolt, float voltage left unchanged\n");
++	} else if (info->voltage_max_design_uv < FLOAT_VOLTAGE_MIN_UV ||
++		   info->voltage_max_design_uv > FLOAT_VOLTAGE_MAX_UV) {
++		return dev_err_probe(chip->dev, -EINVAL,
++				     "float voltage %d uV out of range\n",
++				     info->voltage_max_design_uv);
++	} else {
++		rc = regmap_write(chip->regmap, chip->base + FLOAT_VOLTAGE_CFG,
++				  (info->voltage_max_design_uv -
++				   FLOAT_VOLTAGE_MIN_UV) / FLOAT_VOLTAGE_STEP_UV);
++		if (rc < 0)
++			return dev_err_probe(chip->dev, rc,
++					     "Couldn't set vbat max\n");
++	}
++
++	/* Optional cap on the battery (fast) charge current */
++	if (info->constant_charge_current_max_ua > 0) {
++		if (info->constant_charge_current_max_ua >
++		    FAST_CHARGE_CURRENT_MAX_UA)
++			return dev_err_probe(chip->dev, -EINVAL,
++					     "charge current %d uA out of range\n",
++					     info->constant_charge_current_max_ua);
++
++		rc = regmap_write(chip->regmap,
++				  chip->base + FAST_CHARGE_CURRENT_CFG,
++				  info->constant_charge_current_max_ua /
++				  CURRENT_SCALE_FACTOR);
++		if (rc < 0)
++			return dev_err_probe(chip->dev, rc,
++					     "Couldn't set charge current\n");
++	}
++
++	return 0;
++}
++
+ static int smb5_init_irq(struct smb5_chip *chip, int *irq, const char *name,
+ 			 irqreturn_t (*handler)(int irq, void *data))
+ {
+@@ -941,11 +999,9 @@ static int smb5_probe(struct platform_device *pdev)
+ 		return dev_err_probe(chip->dev, rc,
+ 				     "Failed to init status change work\n");
+ 
+-	rc = (chip->batt_info->voltage_max_design_uv - 3487500) / 7500 + 1;
+-	rc = regmap_update_bits(chip->regmap, chip->base + FLOAT_VOLTAGE_CFG,
+-				FLOAT_VOLTAGE_SETTING_MASK, rc);
++	rc = smb5_init_battery_limits(chip);
+ 	if (rc < 0)
+-		return dev_err_probe(chip->dev, rc, "Couldn't set vbat max\n");
++		return rc;
+ 
+ 	rc = smb5_init_irq(chip, &irq, "bat-ov", smb5_handle_batt_overvoltage);
+ 	if (rc < 0)

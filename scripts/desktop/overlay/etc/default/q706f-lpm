@@ -1,0 +1,13 @@
+# q706f low-power switches (patches 0130-0137), applied at boot by q706f-lpm.service.
+# One module/parameter per line; delete a line (or prefix it with #) to leave that switch off.
+# Validated together on 22.11.2026 (30-min s2idle: gauge unchanged vs 47.9 mA with all off).
+# 7.4-rc3 + 0139: all eight re-validated on 23.11.2026 (isolated + combined RTC runs, panel blank/unblank,
+# touch/pen/charging after wake); on at boot by the owner's choice (earlier 7.3.4 awake hangs not seen yet on 7.4).
+qcom_rpmh_regulator/sleep_bob
+qcom_rpmh_regulator/sleep_l12a
+qcom_pmic_tcpm/l2a_sleep_lpm
+pcie_qcom/radio_off_check
+ctn730/suspend_ven_off
+panel_samsung_amsa26zp01/power_off_on_unprepare
+goodix_berlin_core/sleep_before_poweroff
+clk_rpmh/xo_sleep_audit

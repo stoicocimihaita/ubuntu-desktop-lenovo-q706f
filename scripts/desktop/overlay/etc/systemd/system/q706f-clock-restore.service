@@ -1,9 +1,0 @@
-[Unit]
-Description=Restore the saved clock after the read-only PMIC RTC registered (q706f)
-DefaultDependencies=no
-Before=time-set.target systemd-timesyncd.service
-ConditionPathExists=/etc/fake-hwclock.data
-
-[Service]
-Type=oneshot
-ExecStart=/usr/sbin/fake-hwclock load

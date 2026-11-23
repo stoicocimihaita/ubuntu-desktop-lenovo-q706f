@@ -1,0 +1,43 @@
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Subject: [PATCH] power: supply: qcom_pm8150b_charger: pin the buck switching frequency
+
+The driver never programs DCDC_FSW_SEL; the bootloader leaves 0x08 (1050 kHz).
+The vendor smb5 driver switches it with the input voltage (600 kHz at 5 V,
+1050 kHz at 9 V and with no input, 1200 kHz at 12 V) and sets it before a
+higher voltage is requested. Since this driver does not follow the PD
+contract, pin 1050 kHz: correct for 9 V, merely less efficient at 5 V. This
+makes the 9 V sink PDO (0116) independent of the bootloader state.
+
+--- a/drivers/power/supply/qcom_pm8150b_charger.c
++++ b/drivers/power/supply/qcom_pm8150b_charger.c
+@@ -104,6 +104,14 @@
+ #define P_PATH_POWER_PATH_MASK				GENMASK(2, 1)
+ #define P_PATH_VALID_INPUT_POWER_SOURCE_STS_BIT		BIT(0)
+ 
++/*
++ * Buck switching frequency, vendor chg_freq_list: the register selects twice the
++ * switching frequency, 0x08 = 2100 kHz -> 1050 kHz, 0x0f = 1200 kHz -> 600 kHz.
++ */
++#define DCDC_FSW_SEL				0x150
++#define DCDC_FSW_SEL_MASK			GENMASK(3, 0)
++#define DCDC_FSW_1050_KHZ			0x08
++
+ #define OTG_CFG					0x153
+ #define OTG_RESERVED_BIT			BIT(7)
+ #define FAST_ROLE_SWAP_START_OPTION_BIT		BIT(6)
+@@ -1258,6 +1266,15 @@
+ static const struct smb5_register smb5_init_seq[] = {
+ 	{ .addr = USBIN_CMD_IL, .mask = USBIN_SUSPEND_BIT, .val = 0 },
+ 	{ .addr = AICL_RERUN_TIME_CFG, .mask = AICL_RERUN_TIME_MASK, .val = 0 },
++	/*
++	 * 1050 kHz: the vendor driver's value for 9 V input (freq_9V) and for no
++	 * input (freq_removal); it uses 600 kHz only on a 5 V input. 1050 kHz is
++	 * safe at 5 V too (less efficient), and the bootloader leaves it set, but
++	 * do not rely on that before the 9 V sink PDO (0116) is enabled: a 600 kHz
++	 * buck on a 9 V input means larger inductor ripple.
++	 */
++	{ .addr = DCDC_FSW_SEL, .mask = DCDC_FSW_SEL_MASK,
++	  .val = DCDC_FSW_1050_KHZ },
+ 	/* Configure VBUS for software control */
+ 	{ .addr = OTG_CFG, .mask = OTG_EN_SRC_CFG_BIT, .val = 0 },
+ 	/*

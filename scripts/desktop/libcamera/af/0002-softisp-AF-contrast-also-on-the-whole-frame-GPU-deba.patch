@@ -1,0 +1,71 @@
+From d0dc524b4d9f7621d1870a40964e26c03c18e43c Mon Sep 17 00:00:00 2001
+From: Stoicoci Mihaita <stoicocimihaita@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 16:30:14 +0200
+Subject: [PATCH 2/2] softisp: AF contrast also on the whole-frame (GPU
+ debayer) stats path
+
+---
+ src/ipa/libipa/camera_sensor_helper.cpp    | 34 ++++++++++++++++++++++
+ src/libcamera/software_isp/swstats_cpu.cpp |  1 +
+ 2 files changed, 35 insertions(+)
+
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+index 359040ec..01ee7dca 100644
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -887,6 +887,40 @@ public:
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("ov13858", CameraSensorHelperOv13858)
+ 
++class CameraSensorHelperOv8856 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperOv8856()
++	{
++		/* q706f, Linux 7.3.4 driver: code 128 = 1x, 1/128 steps up to 2047; BLC target 0x4003 = 0x40. */
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 128 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("ov8856", CameraSensorHelperOv8856)
++
++class CameraSensorHelperOv13b10 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperOv13b10()
++	{
++		/* q706f, Linux 7.3.4 driver: code 0x80 = 1x, 1/128 steps up to 0x7c0; BLC target not programmed. */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 128 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("ov13b10", CameraSensorHelperOv13b10)
++
++class CameraSensorHelperS5k5e9 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperS5k5e9()
++	{
++		/* q706f, Linux 7.3.4 driver: SMIA analogue_gain_code_global, code 32 = 1x (inferred). */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 32 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("s5k5e9", CameraSensorHelperS5k5e9)
++
+ class CameraSensorHelperVd55g1 : public CameraSensorHelper
+ {
+ public:
+diff --git a/src/libcamera/software_isp/swstats_cpu.cpp b/src/libcamera/software_isp/swstats_cpu.cpp
+index 424e1eda..a74fb4b2 100644
+--- a/src/libcamera/software_isp/swstats_cpu.cpp
++++ b/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -638,6 +638,7 @@ void SwStatsCpu::processBayerFrame2(MappedFrameBuffer &in)
+ 			continue;
+ 		}
+ 
++		afLine_ = y >= window_.height / 4 && y < window_.height * 3 / 4;
+ 		/* linePointers[0] is not used by any stats0_ functions */
+ 		linePointers[1] = src;
+ 		linePointers[2] = src + stride_;
+-- 
+2.53.0
+

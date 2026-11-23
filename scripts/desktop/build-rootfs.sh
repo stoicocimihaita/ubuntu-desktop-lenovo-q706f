@@ -15,7 +15,7 @@ FLAVOR="${1:-desktop}"
 SUITE=resolute
 MIRROR=http://ports.ubuntu.com/ubuntu-ports
 PKGS="systemd-sysv,udev,dbus,sudo,openssh-server,network-manager,iproute2,iputils-ping,kmod,e2fsprogs,apparmor,locales,ca-certificates,nano,less,linux-firmware,wireless-regdb,bluez,rfkill,dnsmasq-base,zstd,alsa-utils,alsa-ucm-conf,evtest,usbutils,pciutils,i2c-tools,systemd-timesyncd,libinput-tools,iw,avahi-daemon"
-[ "$FLAVOR" = desktop ] && PKGS="$PKGS,ubuntu-desktop-minimal,mesa-utils,mesa-vulkan-drivers,pipewire-audio,gnome-terminal,iio-sensor-proxy,epiphany-browser,xournalpp,gnome-screenshot,libcamera-tools,libcamera-ipa,gstreamer1.0-libcamera,pipewire-libcamera,gnome-snapshot,systemd-zram-generator,rtkit,fake-hwclock,gnome-keyring,libsecret-tools,freerdp3-sdl,gnome-connections,libnss-mdns,avahi-utils,curl,gnome-shell-extensions,systemd-oomd,gnome-system-monitor"
+[ "$FLAVOR" = desktop ] && PKGS="$PKGS,ubuntu-desktop-minimal,mesa-utils,mesa-vulkan-drivers,pipewire-audio,gnome-terminal,iio-sensor-proxy,epiphany-browser,xournalpp,gnome-screenshot,libcamera-tools,libcamera-ipa,gstreamer1.0-libcamera,pipewire-libcamera,gnome-snapshot,systemd-zram-generator,rtkit,fake-hwclock,gnome-keyring,libsecret-tools,freerdp3-sdl,gnome-connections,libnss-mdns,avahi-utils,curl,gnome-shell-extensions,systemd-oomd,gnome-system-monitor,gnome-software,gnome-software-plugin-flatpak,flatpak,x42-plugins,libspa-0.2-modules-extra,lilv-utils,jq"
 
 BRINGUP="${BRINGUP:-0}"
 ROOTFS_NAME="${ROOTFS_NAME:-rootfs}"
